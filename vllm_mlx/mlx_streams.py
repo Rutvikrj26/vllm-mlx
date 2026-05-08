@@ -2,6 +2,7 @@
 """Helpers for binding MLX generation streams to worker threads."""
 
 import importlib
+import inspect
 import logging
 import threading
 from collections.abc import Iterable
@@ -96,6 +97,30 @@ def patch_mlx_lm_prompt_eval() -> bool:
 
     if getattr(cls.prompt, _PATCHED_MARKER, False):
         return True
+
+    # Fail loud if upstream restructures `prompt`. Our replacement body is a
+    # near-verbatim copy of the upstream method with the two ``mx.eval`` calls
+    # swapped for ``_safe_eval``. If mlx-lm bumps the prefill loop to a
+    # different shape (extra padding step, fused eval, single-call API, etc.),
+    # silently installing our stale body would produce wrong-looking output.
+    # Anchor on stable structural invariants and skip the patch if they drift.
+    try:
+        upstream_src = inspect.getsource(cls.prompt)
+    except (OSError, TypeError):
+        upstream_src = ""
+    expected_invariants = (
+        ("mx.eval(", 2),
+        ("_right_pad_prompts", 1),
+        ("prefill_step_size", 1),
+    )
+    if not all(upstream_src.count(token) == n for token, n in expected_invariants):
+        logger.warning(
+            "mlx_lm.generate.PromptProcessingBatch.prompt structure has drifted "
+            "from the version this patch was written against; skipping. "
+            "Cross-thread stream errors during prefill may resurface — pin "
+            "mlx-lm and re-validate the patch body."
+        )
+        return False
 
     original_prompt = cls.prompt
 

@@ -12,6 +12,7 @@ The scheduler follows vLLM's design with:
 """
 
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,6 +31,25 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
+
+# Sentinel for the chosen token's logprob when the model emits -inf or NaN
+# (e.g. heavily masked vocabulary under grammar-constrained decoding).
+# Chosen as a large-magnitude finite float that survives JSON serialization
+# and conveys "effectively zero probability" to confidence-based consumers.
+_MIN_LOGPROB = -1e30
+
+
+def _finite_logprob(lp: float) -> float:
+    """Return ``lp`` if finite, else the ``_MIN_LOGPROB`` sentinel.
+
+    JSON (per RFC 8259) does not represent ``-Infinity`` or ``NaN``; emitting
+    them produces output that strict clients (including the OpenAI Python
+    client) reject. Falling back to a finite sentinel preserves response
+    well-formedness and lets downstream consumers distinguish "very unlikely"
+    from "missing logprob".
+    """
+    return float(lp) if math.isfinite(lp) else _MIN_LOGPROB
+
 
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
@@ -2123,13 +2143,21 @@ class Scheduler:
         ``dist`` is the mx.array carried on a BatchGenerator.Response — the
         log-softmax over the vocabulary at the step that sampled ``token_id``.
         ``top_n`` is the number of top alternatives to include (>=0).
+
+        Non-finite logprobs (``-inf`` for masked tokens under grammar-constrained
+        decoding, ``nan`` from numerical issues) are filtered: the chosen token
+        falls back to ``_MIN_LOGPROB`` (a representable sentinel) and ``-inf``
+        alternatives are dropped from ``top_logprobs``. ``-Infinity`` literals
+        are not valid JSON per RFC 8259 and break strict clients.
         """
         if dist is None:
             return None
         try:
             chosen_lp = float(dist[token_id].item())
-        except Exception:
+        except (IndexError, ValueError, TypeError, RuntimeError) as e:
+            logger.warning("logprob: chosen-token extraction failed: %s", e)
             return None
+        chosen_lp = _finite_logprob(chosen_lp)
 
         top_entries: List[Dict[str, Any]] = []
         if top_n > 0:
@@ -2145,6 +2173,10 @@ class Scheduler:
                     zip(idx_list, val_list), key=lambda pair: pair[1], reverse=True
                 )
                 for tid, lp in pairs:
+                    if not math.isfinite(lp):
+                        # Drop -inf alternatives entirely — under grammar-constrained
+                        # decoding these are masked tokens with no real signal.
+                        continue
                     top_entries.append(
                         {
                             "token": self._decode_logprob_token(int(tid)),
@@ -2152,7 +2184,8 @@ class Scheduler:
                             "bytes": self._token_bytes(int(tid)),
                         }
                     )
-            except Exception:
+            except (IndexError, ValueError, TypeError, RuntimeError) as e:
+                logger.warning("logprob: top-%d extraction failed: %s", top_n, e)
                 top_entries = []
 
         return {
