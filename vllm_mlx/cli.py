@@ -169,8 +169,17 @@ def serve_command(args):
     print("=" * 60)
 
     # Pre-download model with retry/timeout
-    from .api.utils import is_mllm_model
+    from .api.utils import is_mllm_model, set_text_only_override
     from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    # Apply the text-only override before any model-pattern detection runs.
+    # Bypasses the MLLM scheduler / mlx-vlm load / RotatingKVCache path for
+    # multimodal-capable checkpoints we explicitly want to serve text-only.
+    if getattr(args, "text_only", False):
+        if getattr(args, "mllm", False):
+            raise SystemExit("--text-only and --mllm are mutually exclusive")
+        set_text_only_override(True)
+        print("Text-only mode: forcing LLM path (vision/audio components disabled)")
 
     download_config = DownloadConfig(
         download_timeout=args.download_timeout,
@@ -1310,6 +1319,15 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Force LLM (text-only) path for multimodal-capable checkpoints. "
+        "Bypasses mlx-vlm, the MLLM scheduler, and the vision/audio encoders; "
+        "loads weights via mlx_lm with strict=False (vision tower discarded). "
+        "For Gemma 3/4, MedGemma, Pixtral, etc. when image/audio input will not be sent. "
+        "Mutually exclusive with --mllm.",
     )
     serve_parser.add_argument(
         "--trust-remote-code",

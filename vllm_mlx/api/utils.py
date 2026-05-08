@@ -363,6 +363,33 @@ MLLM_PATTERNS = [
 ]
 
 
+# Operator-wide override. When True, ``is_mllm_model`` always returns
+# False, forcing every model down the LLM path regardless of name pattern.
+# Set via ``set_text_only_override`` from the serve CLI's ``--text-only``
+# flag. Useful for multimodal-capable checkpoints (Gemma 3/4, MedGemma,
+# Pixtral, ...) that we run text-only — bypasses mlx-vlm, the MLLM
+# scheduler, RotatingKVCache prefix-cache trimming, and the vision/audio
+# encoders, which are pure overhead for a text workload.
+_TEXT_ONLY_OVERRIDE = False
+
+
+def set_text_only_override(enabled: bool) -> None:
+    """Force ``is_mllm_model`` to always return False.
+
+    Models with both ``text_config`` and ``vision_config`` will then be
+    loaded through the LLM path (``mlx_lm.load`` with ``strict=False``),
+    which drops the vision tower weights at load time and runs the
+    standard text prefill/generation loop.
+    """
+    global _TEXT_ONLY_OVERRIDE
+    _TEXT_ONLY_OVERRIDE = bool(enabled)
+
+
+def is_text_only_override() -> bool:
+    """Return whether the operator-wide text-only override is active."""
+    return _TEXT_ONLY_OVERRIDE
+
+
 def is_mllm_model(model_name: str) -> bool:
     """
     Check if model name indicates a multimodal language model.
@@ -373,6 +400,8 @@ def is_mllm_model(model_name: str) -> bool:
     Returns:
         True if model is detected as MLLM/VLM
     """
+    if _TEXT_ONLY_OVERRIDE:
+        return False
     model_lower = model_name.lower()
     # Explicit text-only variants override multimodal pattern hits. Model
     # families like MedGemma and Gemma 3 publish dedicated text-only
