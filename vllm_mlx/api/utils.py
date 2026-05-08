@@ -374,6 +374,13 @@ def is_mllm_model(model_name: str) -> bool:
         True if model is detected as MLLM/VLM
     """
     model_lower = model_name.lower()
+    # Explicit text-only variants override multimodal pattern hits. Model
+    # families like MedGemma and Gemma 3 publish dedicated text-only
+    # checkpoints (e.g. ``medgemma-27b-text-it``); routing those through the
+    # MLLM path fails because mlx-vlm has no ``gemma3_text`` loader.
+    text_only_markers = ("-text-", "_text_", "-text-it", "/text-")
+    if any(marker in model_lower for marker in text_only_markers):
+        return False
     for pattern in MLLM_PATTERNS:
         if pattern.lower() in model_lower:
             return True
