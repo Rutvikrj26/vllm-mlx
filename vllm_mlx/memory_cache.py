@@ -258,6 +258,36 @@ class _CacheEntry:
         )
 
 
+def _eval_with_stream_recovery(eval_targets: list[Any]) -> None:
+    """Eagerly evaluate ``eval_targets``, tolerating cross-thread MLX streams.
+
+    Cache trims are invoked from the API request thread (via ``add_request``
+    → ``memory_aware_cache.fetch``), but the cache layers were originally
+    produced on the engine thread's generation stream. MLX streams are
+    thread-local, so ``mx.eval`` raises "There is no Stream(gpu, N) in
+    current thread." here. Recover by binding a fresh thread-local default
+    stream; if the trim still can't be materialised eagerly, fall back to
+    lazy evaluation — the engine thread will evaluate the slice on the next
+    forward pass when it consumes the trimmed cache.
+    """
+    import mlx.core as mx
+
+    if not eval_targets:
+        return
+    try:
+        mx.eval(*eval_targets)
+        return
+    except RuntimeError as exc:
+        if "no Stream(" not in str(exc):
+            raise
+    try:
+        mx.set_default_stream(mx.new_stream(mx.default_device()))
+        mx.eval(*eval_targets)
+    except RuntimeError:
+        # Defer to lazy evaluation on the consumer thread.
+        return
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     """Create copies of cache layers with the last ``trim_by`` positions removed.
 
@@ -419,8 +449,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         else:
             trimmed.append(layer_cache)
 
-    if eval_targets:
-        mx.eval(*eval_targets)
+    _eval_with_stream_recovery(eval_targets)
 
     return trimmed
 
@@ -476,8 +505,7 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
         else:
             trimmed.append(layer)
 
-    if eval_targets:
-        mx.eval(*eval_targets)
+    _eval_with_stream_recovery(eval_targets)
 
     return trimmed
 

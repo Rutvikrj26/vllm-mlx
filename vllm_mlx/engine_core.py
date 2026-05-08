@@ -25,7 +25,14 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
-from .mlx_streams import bind_generation_streams
+from .mlx_streams import bind_generation_streams, patch_mlx_lm_prompt_eval
+
+# Install the cross-thread stream-recovery wrapper around
+# `mlx_lm.generate.PromptProcessingBatch.prompt` once, at import. Reaches a
+# bug site we can't fix from inside vllm-mlx's own code (mlx-lm itself
+# calls `mx.eval` on a prompt_cache potentially produced on another
+# thread's GPU stream). Idempotent.
+patch_mlx_lm_prompt_eval()
 
 logger = logging.getLogger(__name__)
 
