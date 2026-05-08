@@ -169,3 +169,118 @@ def patch_mlx_lm_prompt_eval() -> bool:
         "Patched mlx_lm.generate.PromptProcessingBatch.prompt with stream-recovery wrapper"
     )
     return True
+
+
+_BRKVC_MARKER = "_vllm_mlx_brkvc_merge_patched"
+
+
+def patch_mlx_lm_batch_rotating_kv_cache_merge() -> bool:
+    """Wrap ``BatchRotatingKVCache.merge`` to tolerate offset > buffer size.
+
+    Upstream ``mlx_lm.models.cache.BatchRotatingKVCache.merge`` builds the
+    batched KV tensor sized to ``max_length = max(c.size() for c in caches)``,
+    where ``c.size()`` returns the cache's logical offset. For a rotating
+    cache restored from prefix-cache storage the offset can exceed the
+    physical buffer length (``c.keys.shape[2] == max_size``), so the
+    assignment::
+
+        keys[i:i+1, :, p:p+l] = c._temporal_order(c.keys)[..., -l:, :]
+
+    crashes with ``broadcast_shapes`` when the LHS slice is wider than the
+    available buffer. Models like Gemma 3/4 with sliding-window attention
+    exercise this path on every warm prefix-cache hit, defeating the cache.
+
+    Patch the method to clamp ``l`` to the actual buffer length per cache
+    and right-align the source slice in the destination so the most-recent
+    tokens are preserved (matching the rotating-window semantics).
+    Idempotent — multiple calls install the patch only once.
+    """
+    try:
+        cache_mod = importlib.import_module("mlx_lm.models.cache")
+    except ImportError:
+        logger.debug("mlx_lm.models.cache not importable; skipping merge patch")
+        return False
+
+    cls = getattr(cache_mod, "BatchRotatingKVCache", None)
+    if cls is None:
+        logger.debug("BatchRotatingKVCache not present; skipping merge patch")
+        return False
+
+    if getattr(cls.merge, _BRKVC_MARKER, False):
+        return True
+
+    # Anchor on stable structural invariants of upstream's body. If the
+    # method is restructured we skip rather than overlay a stale body.
+    try:
+        upstream_src = inspect.getsource(cls.merge)
+    except (OSError, TypeError):
+        upstream_src = ""
+    expected = (
+        ("c._temporal_order(c.keys)", 1),
+        ("max_size", 3),
+    )
+    if not all(upstream_src.count(token) >= n for token, n in expected):
+        logger.warning(
+            "BatchRotatingKVCache.merge structure has drifted from the "
+            "version this patch was written against; skipping. Prefix-cache "
+            "warm hits on Gemma 3/4 may crash — pin mlx-lm and re-validate."
+        )
+        return False
+
+    @classmethod
+    def _patched_merge(cls_, caches):
+        if not all(c.max_size == caches[0].max_size for c in caches):
+            raise ValueError(
+                "BatchRotatingKVCache can only merge caches with the same maximum size"
+            )
+
+        offsets = [c.offset for c in caches]
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+
+        if max_length == 0:
+            return cls_(caches[0].max_size, [0] * len(caches))
+
+        padding = [max_length - lng for lng in lengths]
+        B = len(caches)
+        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+        Dk = max(c.keys.shape[3] for c in caches if c.keys is not None)
+        Dv = max(c.values.shape[3] for c in caches if c.values is not None)
+        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+        keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
+        values = mx.zeros((B, H, max_length, Dv), dtype=dt)
+        for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
+            if c.keys is None:
+                continue
+            # Clamp to the actual buffer length. For caches whose offset
+            # exceeds the rotating-window buffer (typical for prefix-cache
+            # entries restored from disk), the rotating window already
+            # discarded the oldest tokens — we have only ``buf_l`` of
+            # most-recent tokens to write, right-aligned in the slot the
+            # batch reserved for this cache.
+            buf_l = c.keys.shape[2]
+            actual_l = min(l, buf_l)
+            dst_start = p + (l - actual_l)
+            keys[i : i + 1, :, dst_start : p + l] = c._temporal_order(c.keys)[
+                ..., -actual_l:, :
+            ]
+            values[i : i + 1, :, dst_start : p + l] = c._temporal_order(c.values)[
+                ..., -actual_l:, :
+            ]
+
+        cache = cls_(caches[0].max_size, padding)
+        cache.keys = keys
+        cache.values = values
+        cache.offset = mx.array(offsets)
+        cache._idx = keys.shape[2]
+        cache._offset = keys.shape[2]
+        return cache
+
+    setattr(_patched_merge.__func__, _BRKVC_MARKER, True)
+    cls.merge = _patched_merge
+    logger.info(
+        "Patched mlx_lm.models.cache.BatchRotatingKVCache.merge to tolerate "
+        "offset > buffer size on prefix-cache warm hits"
+    )
+    return True

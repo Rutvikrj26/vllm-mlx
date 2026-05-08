@@ -25,14 +25,23 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
-from .mlx_streams import bind_generation_streams, patch_mlx_lm_prompt_eval
+from .mlx_streams import (
+    bind_generation_streams,
+    patch_mlx_lm_batch_rotating_kv_cache_merge,
+    patch_mlx_lm_prompt_eval,
+)
 
-# Install the cross-thread stream-recovery wrapper around
-# `mlx_lm.generate.PromptProcessingBatch.prompt` once, at import. Reaches a
-# bug site we can't fix from inside vllm-mlx's own code (mlx-lm itself
-# calls `mx.eval` on a prompt_cache potentially produced on another
-# thread's GPU stream). Idempotent.
+# Install upstream-mlx-lm patches at import time. Both reach bug sites we
+# can't fix from inside vllm-mlx's own code:
+#  - prompt_eval: mlx-lm calls ``mx.eval`` on a prompt_cache potentially
+#    produced on another thread's GPU stream
+#  - batch_rotating_kv_cache_merge: ``BatchRotatingKVCache.merge`` crashes on
+#    warm prefix-cache hits when the cached entry's offset exceeds the
+#    rotating-window buffer (common with sliding-window models like Gemma
+#    3/4). Without this, prefix caching is unusable for those models.
+# Both are idempotent.
 patch_mlx_lm_prompt_eval()
+patch_mlx_lm_batch_rotating_kv_cache_merge()
 
 logger = logging.getLogger(__name__)
 

@@ -672,24 +672,28 @@ def _prepare_chat_completion_invocation(
         effective_thinking = (
             request.enable_thinking is True or ctk.get("enable_thinking") is True
         )
-
-        if _reasoning_parser and effective_thinking:
-            # User explicitly requested thinking with constrained decoding
-            # (via top-level enable_thinking or chat_template_kwargs).
-            # Wrap the processor so the enforcer only activates after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
+        wants_think_tag = bool(_reasoning_parser and effective_thinking)
+        if not wants_think_tag:
             # Suppress thinking so the model goes straight to JSON.
-            # The template injects an empty <think></think> block and the
-            # enforcer constrains output from the first token onward.
-            # Force both top-level and chat_template_kwargs to prevent the
-            # Jinja template from rendering an open <think> block.
+            # Force both top-level and chat_template_kwargs so the Jinja
+            # template doesn't render an open <think> block.
             request.enable_thinking = False
             chat_kwargs["enable_thinking"] = False
             if "chat_template_kwargs" in chat_kwargs:
                 chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+        # Always wrap with the preamble-skip processor. The wrapper:
+        #   - thinking model: waits for </think>, then scans for { / [
+        #   - non-thinking model with chat-structure preamble (Gemma 4's
+        #     <channel|>analysis<|message|>...<channel|>final<|message|>{,
+        #     OpenAI harmony, etc.): skips first 3 tokens, detects no <think>,
+        #     scans for { / [, activates enforcer when found
+        #   - plain JSON-first model: skips first 3 tokens, finds { quickly
+        # Without this wrapper the inner enforcer sees the preamble tokens,
+        # finds them outside the JSON allowed-set, and disables itself.
+        json_logits_processor = _ThinkingAwareLogitsProcessor(
+            json_logits_processor, prompt_has_think_tag=wants_think_tag
+        )
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
@@ -765,15 +769,18 @@ def _prepare_anthropic_invocation(
         effective_thinking = (
             openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
         )
-
-        if _reasoning_parser and effective_thinking:
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
+        wants_think_tag = bool(_reasoning_parser and effective_thinking)
+        if not wants_think_tag:
             chat_kwargs["enable_thinking"] = False
             if "chat_template_kwargs" in chat_kwargs:
                 chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+        # See the matching branch in _prepare_chat_completion_invocation
+        # for why we always wrap (preamble-skip handles non-think chat
+        # structure tokens like Gemma 4's <channel|>...<|message|>).
+        json_logits_processor = _ThinkingAwareLogitsProcessor(
+            json_logits_processor, prompt_has_think_tag=wants_think_tag
+        )
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
