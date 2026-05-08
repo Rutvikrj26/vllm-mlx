@@ -30,6 +30,9 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # Per-token logprobs in OpenAI Chat Completions shape (None when not
+    # requested). Each entry: {"token", "logprob", "bytes", "top_logprobs"}.
+    logprobs: list[dict] | None = None
 
 
 @contextmanager

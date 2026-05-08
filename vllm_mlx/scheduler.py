@@ -2114,6 +2114,85 @@ class Scheduler:
 
         return scheduled
 
+    def _build_logprob_entry(
+        self, token_id: int, dist: Any, top_n: int
+    ) -> Optional[Dict[str, Any]]:
+        """Build an OpenAI-shaped logprobs.content[] entry from a vocab-size
+        log-softmax distribution.
+
+        ``dist`` is the mx.array carried on a BatchGenerator.Response — the
+        log-softmax over the vocabulary at the step that sampled ``token_id``.
+        ``top_n`` is the number of top alternatives to include (>=0).
+        """
+        if dist is None:
+            return None
+        try:
+            chosen_lp = float(dist[token_id].item())
+        except Exception:
+            return None
+
+        top_entries: List[Dict[str, Any]] = []
+        if top_n > 0:
+            try:
+                k = min(top_n, dist.shape[-1])
+                # argpartition returns unsorted; pull top-k then sort by logprob desc.
+                idx = mx.argpartition(-dist, k - 1)[:k]
+                values = dist[idx]
+                mx.eval(idx, values)
+                idx_list = idx.tolist()
+                val_list = values.tolist()
+                pairs = sorted(
+                    zip(idx_list, val_list), key=lambda pair: pair[1], reverse=True
+                )
+                for tid, lp in pairs:
+                    top_entries.append(
+                        {
+                            "token": self._decode_logprob_token(int(tid)),
+                            "logprob": float(lp),
+                            "bytes": self._token_bytes(int(tid)),
+                        }
+                    )
+            except Exception:
+                top_entries = []
+
+        return {
+            "token": self._decode_logprob_token(int(token_id)),
+            "logprob": chosen_lp,
+            "bytes": self._token_bytes(int(token_id)),
+            "top_logprobs": top_entries,
+        }
+
+    def _decode_logprob_token(self, token_id: int) -> str:
+        """Decode a single token id to its string form for logprobs output.
+
+        Falls back to the raw token id (e.g. ``"<|123|>"``) when decoding
+        fails, mirroring vLLM behaviour for unparseable bytes.
+        """
+        tok = self._actual_tokenizer
+        try:
+            if hasattr(tok, "decode"):
+                text = tok.decode([token_id])
+                if text:
+                    return text
+        except Exception:
+            pass
+        try:
+            convert = getattr(tok, "convert_ids_to_tokens", None)
+            if convert is not None:
+                converted = convert([token_id])
+                if converted:
+                    return converted[0]
+        except Exception:
+            pass
+        return f"<|{token_id}|>"
+
+    def _token_bytes(self, token_id: int) -> List[int]:
+        """Return the UTF-8 bytes of a token's string form, [] on failure."""
+        try:
+            return list(self._decode_logprob_token(token_id).encode("utf-8"))
+        except Exception:
+            return []
+
     def _process_batch_responses(
         self, responses: List[Any]
     ) -> Tuple[List[RequestOutput], Set[str]]:
@@ -2155,6 +2234,21 @@ class Scheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            # If the request asked for logprobs, extract one entry per token
+            # from the response's vocab-size log-softmax distribution. The
+            # finish_reason="stop" response carries the EOS token's distribution;
+            # we still record it so the per-token list aligns with output tokens.
+            step_logprobs = None
+            requested_lp = request.sampling_params.logprobs
+            if requested_lp is not None:
+                entry = self._build_logprob_entry(
+                    response.token,
+                    getattr(response, "logprobs", None),
+                    max(int(requested_lp), 0),
+                )
+                if entry is not None:
+                    step_logprobs = [entry]
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -2163,6 +2257,7 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                logprobs=step_logprobs,
             )
 
             # Check if finished

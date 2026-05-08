@@ -191,6 +191,11 @@ class ChatCompletionRequest(BaseModel):
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
+    # Per-token logprobs (OpenAI-compatible). When True, each generated token's
+    # logprob is returned on the choice; combine with `top_logprobs` to also
+    # request the top alternatives at each step.
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
 
 
 class AssistantMessage(BaseModel):
@@ -229,6 +234,10 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: AssistantMessage
     finish_reason: str | None = "stop"
+    # OpenAI-shaped logprobs payload: {"content": [{"token", "logprob",
+    # "bytes", "top_logprobs": [...]}, ...]}. Only set when the request asked
+    # for logprobs.
+    logprobs: dict | None = None
 
 
 class Usage(BaseModel):

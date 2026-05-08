@@ -65,6 +65,9 @@ class SamplingParams:
     # decoding via ``lm-format-enforcer``).  These are merged with any
     # built-in processors (repetition/presence penalty) at batch time.
     logits_processors: Optional[List[Callable]] = None
+    # Per-token logprobs to return. None = disabled, 0 = chosen token only,
+    # N > 0 = chosen token plus top-N alternatives.
+    logprobs: Optional[int] = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -213,6 +216,11 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Per-step logprobs (one entry per generated token). Each entry is an
+    # OpenAI-shaped dict: {"token": str, "logprob": float, "bytes": [int],
+    # "top_logprobs": [{"token", "logprob", "bytes"}, ...]}. None when
+    # logprobs were not requested.
+    logprobs: Optional[List[Dict[str, Any]]] = None
 
     @property
     def usage(self) -> Dict[str, int]:

@@ -777,6 +777,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            logprobs=kwargs.pop("logprobs", None),
         )
 
         output = await self._engine.generate(
@@ -792,6 +793,7 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            logprobs=output.logprobs,
         )
 
     async def stream_generate(

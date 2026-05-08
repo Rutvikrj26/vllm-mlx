@@ -638,6 +638,11 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    if request.logprobs:
+        # Internal contract: integer = number of top alternatives to capture
+        # (0 = chosen token only). OpenAI sends `logprobs: true` to enable
+        # and `top_logprobs: N` for the alternatives count.
+        chat_kwargs["logprobs"] = int(request.top_logprobs or 0)
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )
@@ -4648,6 +4653,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
         )
+        choice_logprobs = (
+            {"content": output.logprobs} if request.logprobs and output.logprobs else None
+        )
         return ChatCompletionResponse(
             model=_model_name,
             choices=[
@@ -4660,6 +4668,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         tool_calls=tool_calls,
                     ),
                     finish_reason=finish_reason,
+                    logprobs=choice_logprobs,
                 )
             ],
             usage=Usage(
