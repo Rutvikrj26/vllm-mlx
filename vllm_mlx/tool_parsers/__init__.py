@@ -10,6 +10,7 @@ Available parsers:
 - mistral: Mistral models ([TOOL_CALLS] format)
 - qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
 - llama/llama3/llama4: Llama models (<function=name> format)
+- gemma3/medgemma: Google Gemma 3 / MedGemma models (```tool_code print(Func()) format)
 - gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
@@ -62,6 +63,7 @@ from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 from .qwen3_xml_tool_parser import Qwen3XMLToolParser
+from .gemma3_tool_parser import Gemma3ToolParser
 
 
 def get_parser_stop_tokens(
@@ -96,6 +98,7 @@ __all__ = [
     "get_parser_stop_tokens",
     # Specific parsers
     "AutoToolParser",
+    "Gemma3ToolParser",
     "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",

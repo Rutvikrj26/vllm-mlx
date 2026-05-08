@@ -419,6 +419,34 @@ def is_mllm_model(model_name: str) -> bool:
 # Backwards compatibility alias
 is_vlm_model = is_mllm_model
 
+# Patterns that identify Gemma 4 model checkpoints (including MedGemma which is
+# based on Gemma 4).  Used to activate native Gemma 4 tool calling on the LLM
+# (text-only) path without requiring --enable-auto-tool-choice.
+_GEMMA4_PATTERNS = [
+    "gemma-4",
+    "gemma4",
+    "medgemma",
+    "MedGemma",
+]
+
+
+def is_gemma4_family(model_name: str) -> bool:
+    """Return True when *model_name* belongs to the Gemma 4 / MedGemma family.
+
+    Intentionally does NOT consult ``_TEXT_ONLY_OVERRIDE``.  The flag is
+    relevant for MLLM-vs-LLM routing, but this function is used *after*
+    routing to decide which tool parser to apply, so it must return True
+    regardless of whether the model is running in text-only mode.
+
+    Args:
+        model_name: HuggingFace model identifier or local path.
+
+    Returns:
+        True if the model is Gemma 4 or MedGemma.
+    """
+    model_lower = model_name.lower()
+    return any(p.lower() in model_lower for p in _GEMMA4_PATTERNS)
+
 
 # =============================================================================
 # Media Content Detection

@@ -142,6 +142,7 @@ from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
+    is_gemma4_family,
     is_mllm_model,  # noqa: F401
 )
 from .audio_limits import (
@@ -660,6 +661,17 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["tools"] = template_tools
 
     parser_name = _tool_call_parser if _enable_auto_tool_choice else None
+    # When Gemma 4 runs on the LLM path with tools and no explicit parser has
+    # been configured via --enable-auto-tool-choice, activate the gemma4 parser
+    # name so that (a) <|tool_response> is added as a stop token and (b) the
+    # response-parsing path below picks up the right parser instance.
+    if (
+        parser_name is None
+        and request.tools
+        and request.tool_choice != "none"
+        and _is_gemma4_llm_path(engine)
+    ):
+        parser_name = "gemma4"
     merged_stop = get_parser_stop_tokens(parser_name, request.stop)
     if merged_stop:
         chat_kwargs["stop"] = merged_stop
@@ -1605,6 +1617,55 @@ def _get_or_init_tool_parser(engine: BaseEngine | None = None):
     return _tool_parser_instance
 
 
+def _parse_with_gemma4_parser(
+    output_text: str,
+    request_dict: dict | None,
+    engine: BaseEngine | None,
+) -> tuple[str, list | None]:
+    """Parse Gemma 4 native tool calls without requiring global auto-tool flags.
+
+    Creates a *per-call* Gemma4ToolParser instance so it does not interfere
+    with the globally cached ``_tool_parser_instance`` which may be bound to a
+    different parser (or None).  This is intentionally NOT cached: Gemma 4 LLM
+    path tool calling is a request-level bypass, not the server-wide default.
+
+    Returns the same ``(cleaned_text, tool_calls)`` shape as
+    ``_parse_tool_calls_with_parser``.
+    """
+    try:
+        parser_cls = ToolParserManager.get_tool_parser("gemma4")
+        tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+        parser = parser_cls(tokenizer)
+        result = parser.extract_tool_calls(output_text, request_dict)
+        if result.tools_called:
+            tools = request_dict.get("tools") if request_dict else None
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                    type="function",
+                    function=FunctionCall(
+                        name=tc["name"],
+                        arguments=_coerce_tool_arguments(
+                            tc["arguments"], tc["name"], tools
+                        ),
+                    ),
+                )
+                for tc in result.tool_calls
+            ]
+            logger.debug(
+                "Gemma 4 LLM-path tool parser: found %d tool call(s)", len(tool_calls)
+            )
+            return result.content or "", tool_calls
+        # Parser found no tool calls — fall through to generic
+        return parse_tool_calls(output_text, request_dict)
+    except Exception as e:
+        logger.warning(
+            "Gemma 4 LLM-path tool parser error: %s; falling back to generic",
+            _sanitize_log_text(e, limit=500),
+        )
+        return parse_tool_calls(output_text, request_dict)
+
+
 def _parse_tool_calls_with_parser(
     output_text: str,
     request: ChatCompletionRequest | None = None,
@@ -1636,8 +1697,18 @@ def _parse_tool_calls_with_parser(
         if tool_choice == "none":
             return output_text, None
 
-    # If auto tool choice is not enabled, use the generic parser
+    # If auto tool choice is not enabled, check whether this is a Gemma 4 model
+    # running on the LLM path with tools in the request.  If so, bypass the
+    # global flag and use the gemma4 parser directly — the model emits
+    # <|tool_call>...<tool_call|> natively but the generic parser doesn't know
+    # about that format.
     if not _enable_auto_tool_choice or not _tool_call_parser:
+        if (
+            _is_gemma4_llm_path(engine)
+            and request is not None
+            and getattr(request, "tools", None)
+        ):
+            return _parse_with_gemma4_parser(output_text, request_dict, engine)
         return parse_tool_calls(output_text, request_dict)
 
     # Initialize parser if needed
@@ -2693,6 +2764,26 @@ def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
     return tool_choice == "none"
 
 
+def _is_gemma4_llm_path(engine: BaseEngine | None = None) -> bool:
+    """Return True when the active engine is a Gemma 4 / MedGemma model running
+    on the LLM (text-only) path.
+
+    This is the condition under which we need to activate the native Gemma 4
+    tool-call parser even if ``--enable-auto-tool-choice`` was not passed on the
+    command line, because the MLLM path auto-activates it but the LLM path does
+    not.
+
+    ``engine.is_mllm`` is False both for pure LLM models and for
+    multimodal checkpoints forced onto the LLM path via ``--text-only``.
+    We therefore only check the model name, not ``is_mllm``.
+    """
+    target = engine if engine is not None else _engine
+    if target is None:
+        return False
+    model_name = getattr(target, "_model_name", None) or _model_name or ""
+    return is_gemma4_family(model_name)
+
+
 def _get_streaming_tool_parser(
     request: ChatCompletionRequest | None,
     engine: BaseEngine | None = None,
@@ -2727,6 +2818,21 @@ def _get_streaming_tool_parser(
 
     if not getattr(request, "tools", None):
         return None
+
+    # Gemma 4 on LLM path: bypass global auto-tool-choice and use the native
+    # gemma4 parser directly so streaming picks up <|tool_call>...<tool_call|>.
+    if _is_gemma4_llm_path(engine):
+        try:
+            parser_cls = ToolParserManager.get_tool_parser("gemma4")
+            parser = parser_cls(tokenizer)
+            parser.reset()
+            return parser
+        except Exception as e:
+            logger.warning(
+                "Failed to init Gemma 4 streaming tool parser: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+            return None
 
     try:
         parser_cls = ToolParserManager.get_tool_parser("auto")

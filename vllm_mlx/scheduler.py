@@ -184,6 +184,155 @@ def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -
     batch_gen._process_prompts = _patched_process_prompts
 
 
+# ---------------------------------------------------------------------------
+# mlx-lm 0.31.x (new-API) adapters
+# ---------------------------------------------------------------------------
+# mlx-lm 0.31.x restructured BatchGenerator: _process_prompts and active_batch
+# are gone.  Chunked prefill is now controlled by ``prefill_step_size`` on both
+# BatchGenerator (slices segments fed per _next() call) and PromptProcessingBatch
+# (inner while-loop chunk size inside .prompt()).  The adapters below wire
+# --chunked-prefill-tokens into those attributes and use inspect.getsource()
+# invariant guards so a future mlx-lm restructure logs a warning + skips instead
+# of silently installing stale code — matching the pattern in mlx_streams.py.
+# ---------------------------------------------------------------------------
+
+_CHUNKED_V2_MARKER = "_vllm_mlx_chunked_prefill_v2"
+_PROMPT_CACHE_SAVE_V2_MARKER = "_vllm_mlx_prompt_cache_save_v2"
+
+
+def _detect_new_api(batch_gen: "BatchGenerator") -> bool:
+    """Return True when *batch_gen* uses the mlx-lm 0.31.x BatchGenerator API.
+
+    Probes for the structural invariants that the v2 adapters depend on:
+    - ``_prompt_batch`` attribute (a PromptProcessingBatch instance)
+    - ``prefill_step_size`` on both BatchGenerator and PromptProcessingBatch
+    - ``_next`` body calls ``self._prompt_batch.prompt`` and ``prefill_step_size``
+    """
+    import inspect
+
+    if not (
+        hasattr(batch_gen, "_prompt_batch")
+        and hasattr(batch_gen, "prefill_step_size")
+        and hasattr(batch_gen._prompt_batch, "prefill_step_size")
+    ):
+        return False
+
+    # Structural guard: verify _next contains the expected call sites so that a
+    # future mlx-lm restructure is caught at startup rather than silently misfiring.
+    try:
+        next_src = inspect.getsource(type(batch_gen)._next)
+    except (OSError, TypeError):
+        next_src = ""
+
+    required_tokens = (
+        "self._prompt_batch.prompt",
+        "prefill_step_size",
+        "self._generation_batch",
+        "self._unprocessed_sequences",
+    )
+    if not all(tok in next_src for tok in required_tokens):
+        logger.warning(
+            "mlx_lm BatchGenerator._next structure has drifted from the version "
+            "the chunked-prefill v2 adapter was written against; falling back to "
+            "no chunked prefill. Pin mlx-lm and re-validate."
+        )
+        return False
+
+    return True
+
+
+def _adapt_chunked_prefill_v2(
+    batch_gen: "BatchGenerator",
+    budget: int,
+) -> None:
+    """Wire *budget* into the mlx-lm 0.31.x BatchGenerator prefill machinery.
+
+    mlx-lm 0.31.x performs chunked prefill natively via ``prefill_step_size``
+    on both ``BatchGenerator`` (caps the segment slice fed per ``_next()`` call)
+    and ``PromptProcessingBatch`` (inner while-loop inside ``.prompt()``).
+    This adapter simply sets both to *budget*, replacing any larger value
+    that may have been passed at construction time.
+
+    Idempotent: calling again with a different budget updates in-place.
+    """
+    # Set on the BatchGenerator so _next() slices segments to ≤ budget tokens
+    batch_gen.prefill_step_size = budget
+    # Mirror on the live PromptProcessingBatch so .prompt()'s inner loop also
+    # respects the budget for any in-flight prompt that spans multiple steps.
+    batch_gen._prompt_batch.prefill_step_size = budget
+    setattr(batch_gen, _CHUNKED_V2_MARKER, True)
+    logger.info(
+        f"[chunked_prefill] v2 adapter installed (mlx-lm 0.31.x native path), "
+        f"budget={budget} tokens per step"
+    )
+
+
+def _install_prompt_cache_save_v2(
+    batch_gen: "BatchGenerator", prompt_cache_save
+) -> None:
+    """Hook prompt-cache saves onto the mlx-lm 0.31.x BatchGenerator API.
+
+    In 0.31.x the natural capture point for the prompt-only KV cache is just
+    after ``PromptProcessingBatch`` sequences transition to generation — i.e.
+    inside ``BatchGenerator._next()`` when ``gen_batch`` is built via
+    ``split().generate()``.  We wrap ``_next`` to fire ``prompt_cache_save``
+    for every uid that just completed prefill (identified by being present in
+    the newly created ``gen_batch`` after the split).
+
+    Structural invariant guard mirrors the pattern in mlx_streams.py.
+    """
+    import inspect
+
+    if getattr(batch_gen._next, _PROMPT_CACHE_SAVE_V2_MARKER, False):
+        return  # already installed
+
+    # Verify the structural tokens our wrapper depends on are still present.
+    try:
+        next_src = inspect.getsource(type(batch_gen)._next)
+    except (OSError, TypeError):
+        next_src = ""
+
+    required_tokens = (
+        "gen_batch = self._prompt_batch.split(split).generate(last_inputs)",
+        "self._generation_batch.extend(gen_batch)",
+    )
+    if not all(tok in next_src for tok in required_tokens):
+        logger.warning(
+            "mlx_lm BatchGenerator._next structure has drifted from the version "
+            "the prompt-cache-save v2 hook was written against; skipping. "
+            "Prompt-only cache entries will NOT be captured for memory-aware cache."
+        )
+        return
+
+    _orig_next = batch_gen._next
+
+    def _hooked_next(_self=batch_gen):
+        # Track uids that were in _prompt_batch before the call so we can
+        # identify which ones transitioned to generation (and thus have a
+        # freshly computed prompt-only cache).
+        pre_prompt_uids = set(_self._prompt_batch.uids)
+        result = _orig_next()
+        post_gen_uids = set(_self._generation_batch.uids)
+        # Newly graduated uids = in generation batch now but were in prompt batch
+        graduated = pre_prompt_uids & post_gen_uids
+        if graduated:
+            # extract_cache is available on GenerationBatch too; find the index
+            for uid in graduated:
+                try:
+                    idx = _self._generation_batch.uids.index(uid)
+                    prompt_cache_save(uid, _self._generation_batch.extract_cache(idx))
+                except Exception:
+                    pass
+        return result
+
+    setattr(_hooked_next, _PROMPT_CACHE_SAVE_V2_MARKER, True)
+    batch_gen._next = _hooked_next
+    logger.info(
+        "Installed prompt-cache-save v2 hook on BatchGenerator._next "
+        "(mlx-lm 0.31.x path)"
+    )
+
+
 def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
@@ -1357,48 +1506,58 @@ class Scheduler:
         chunked_budget = self.config.chunked_prefill_tokens
         need_chunked = chunked_budget > 0
 
-        # The chunked prefill monkey-patch relies on BatchGenerator internals
-        # (_process_prompts, active_batch, _step, etc.) that were refactored
-        # in mlx-lm 0.31.x.  Skip gracefully when the required API is absent.
-        chunked_compatible = hasattr(bg, "_process_prompts") and hasattr(
-            bg, "active_batch"
-        )
+        # Detect which BatchGenerator API generation is present.
+        # mlx-lm 0.31.x (new API): _prompt_batch + prefill_step_size
+        # mlx-lm <0.31.x (old API): _process_prompts + active_batch
+        _new_api = _detect_new_api(bg)
+        _old_api = hasattr(bg, "_process_prompts") and hasattr(bg, "active_batch")
 
         prompt_cache_cb = None
         if self.memory_aware_cache is not None:
             prompt_cache_cb = self._make_prompt_cache_save_callback()
 
-        if need_chunked and chunked_compatible:
-            # Full chunked prefill with mid-prefill saves and prompt cache
-            # save wired through the chunked next() and _process_prompts
-            # monkey-patches inside _install_chunked_prefill.
-            mid_prefill_cb = None
-            save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and self.memory_aware_cache is not None:
-                mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
-                logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            _install_chunked_prefill(
-                bg,
-                chunked_budget,
-                mid_prefill_cb,
-                prompt_cache_save=prompt_cache_cb,
-                pending_abort_ids=self._pending_abort_ids,
-                uid_to_request_id=self.uid_to_request_id,
-                requests=self.requests,
-            )
-        elif need_chunked and not chunked_compatible:
-            logger.warning(
-                "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
-                "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
-                "check compatibility."
-            )
+        if need_chunked:
+            if _new_api:
+                # mlx-lm 0.31.x: prefill_step_size controls chunking natively.
+                # The v2 adapter sets both bg.prefill_step_size and
+                # bg._prompt_batch.prefill_step_size to the requested budget.
+                _adapt_chunked_prefill_v2(bg, chunked_budget)
+                # Wire prompt-cache-save if memory_aware_cache is active.
+                if prompt_cache_cb is not None:
+                    _install_prompt_cache_save_v2(bg, prompt_cache_cb)
+            elif _old_api:
+                # Legacy mlx-lm (<0.31.x): full monkey-patch of _next() and
+                # _process_prompts via _install_chunked_prefill.
+                mid_prefill_cb = None
+                save_interval = self.config.mid_prefill_save_interval
+                if save_interval > 0 and self.memory_aware_cache is not None:
+                    mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
+                    logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
+                _install_chunked_prefill(
+                    bg,
+                    chunked_budget,
+                    mid_prefill_cb,
+                    prompt_cache_save=prompt_cache_cb,
+                    pending_abort_ids=self._pending_abort_ids,
+                    uid_to_request_id=self.uid_to_request_id,
+                    requests=self.requests,
+                )
+            else:
+                logger.warning(
+                    "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
+                    "internals for either the legacy (_process_prompts, active_batch) "
+                    "or current (_prompt_batch, prefill_step_size) API. "
+                    "Upgrade mlx-lm or check compatibility."
+                )
 
         # When chunked prefill is off but memory_aware_cache is active,
-        # install the lightweight _process_prompts hook so prompt-only
+        # install the lightweight prompt-cache-save hook so prompt-only
         # cache entries are still captured.  This is the only safe capture
         # point for hybrid Mamba+Transformer models (#178).
         if not need_chunked and prompt_cache_cb is not None:
-            if hasattr(bg, "_process_prompts"):
+            if _new_api:
+                _install_prompt_cache_save_v2(bg, prompt_cache_cb)
+            elif hasattr(bg, "_process_prompts"):
                 _install_prompt_cache_save(bg, prompt_cache_cb)
 
         # Install MTP if the model supports it
