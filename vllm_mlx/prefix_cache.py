@@ -661,10 +661,21 @@ class BlockAwarePrefixCache:
                 class_ref = layer_state.get("class_ref")
                 class_name = layer_state.get("class_name")
 
+                # RotatingKVCache (sliding-window layers) stores a ring buffer of
+                # max_size tokens.  The buffer is NOT linearly sliceable block-by-
+                # block — once offset > max_size the ring wraps and earlier absolute
+                # positions are gone.  Force "latest" storage for these layers: only
+                # the final block (end_idx == total_tokens) carries the full ring
+                # state that reconstruct_cache needs.  Routing them through "concat"
+                # would mis-detect seq_axis=2 on the 4-D tensor and then raise a
+                # "Block slice [N:M] exceeds seq_len 1024" error for every block
+                # past the ring boundary, silently defeating prefix caching.
+                _is_rotating = class_name == "RotatingKVCache"
+
                 seq_axis = self._cache_state_seq_axis(state)
-                if seq_axis is not None:
+                if seq_axis is not None and not _is_rotating:
                     state_slice = self._slice_concat_cache_state(
-                        state, start_idx, end_idx
+                        state, start_idx, end_idx, class_name=class_name
                     )
                     block_slices.append(
                         {
@@ -688,6 +699,17 @@ class BlockAwarePrefixCache:
                             "storage": "latest",
                         }
                     )
+                    if _is_rotating:
+                        # Confirm the sliding-layer ring was captured successfully.
+                        seq_ax = self._cache_state_seq_axis(state)
+                        if seq_ax is not None and state:
+                            n_tokens = state[0].shape[seq_ax]
+                            logger.debug(
+                                f"[prefix-cache slice] retrieved {n_tokens} tokens "
+                                f"(clamped from offset "
+                                f"{int(meta_state[2]) if meta_state and len(meta_state) > 2 else 'unknown'}) "
+                                f"for layer {class_name}"
+                            )
                 else:
                     block_slices.append(None)
 
@@ -729,22 +751,40 @@ class BlockAwarePrefixCache:
         state: Tuple[Any, ...] | List[Any],
         start_idx: int,
         end_idx: int,
+        class_name: Optional[str] = None,
     ) -> Tuple[Any, ...] | List[Any]:
-        """Slice a sequence-backed cache state across the token axis."""
+        """Slice a sequence-backed cache state across the token axis.
+
+        When the requested [start_idx:end_idx] window exceeds the physical
+        buffer length (e.g. a sliding-window cache whose ring has wrapped),
+        the slice is right-aligned: we return the last ``block_size`` tokens
+        that are present in the buffer.  This matches the rotating-window
+        semantics used by ``BatchRotatingKVCache.merge``.
+        """
         seq_axis = self._cache_state_seq_axis(state)
         if seq_axis is None:
             raise ValueError("Cache state does not support sequence concatenation")
 
         seq_len = state[0].shape[seq_axis]
         actual_end = min(end_idx, seq_len)
+
         if start_idx >= actual_end:
-            raise ValueError(
-                f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
+            # Right-align: preserve the most-recent tokens up to the buffer end.
+            block_size = end_idx - start_idx
+            clamped_end = seq_len
+            clamped_start = max(0, seq_len - block_size)
+            layer_tag = f" for layer {class_name}" if class_name else ""
+            logger.debug(
+                f"[prefix-cache slice] retrieved {clamped_end - clamped_start} tokens "
+                f"(clamped from offset {start_idx}){layer_tag}"
             )
+            actual_start, actual_end = clamped_start, clamped_end
+        else:
+            actual_start = start_idx
 
         def _slice_tensor(tensor: Any) -> Any:
             slices = [slice(None)] * len(tensor.shape)
-            slices[seq_axis] = slice(start_idx, actual_end)
+            slices[seq_axis] = slice(actual_start, actual_end)
             return tensor[tuple(slices)]
 
         sliced = [_slice_tensor(tensor) for tensor in state]

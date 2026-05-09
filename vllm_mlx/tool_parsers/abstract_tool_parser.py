@@ -22,6 +22,16 @@ from transformers import PreTrainedTokenizerBase
 THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
 IMPLICIT_THINK_PATTERN = re.compile(r"^.*?</think>", re.DOTALL)
 
+# Gemma 4 channel-style thinking blocks emitted when enable_thinking=True.
+# The model wraps its internal reasoning in:
+#   <|channel>thought\n...<channel|>
+# This pattern must be stripped BEFORE tool-call envelope search so that
+# `<|tool_call>` is the first thing the parser sees.
+# Note the asymmetric delimiters: opening uses `<|channel>`, closing uses `<channel|>`.
+GEMMA4_CHANNEL_THOUGHT_PATTERN = re.compile(
+    r"<\|channel>thought\n.*?<channel\|>", re.DOTALL
+)
+
 
 @dataclass
 class ExtractedToolCallInformation:
@@ -76,13 +86,16 @@ class ToolParser(ABC):
         """
         Strip think tags from text.
 
-        Handles two scenarios:
+        Handles three scenarios:
         1. Full tags: <think>...</think> in output
         2. Only closing tag: ...</think> when <think> was in prompt
+        3. Gemma 4 channel-style: <|channel>thought\\n...<channel|>
+           (emitted by Gemma 4 when enable_thinking=True in tools output mode)
 
         Used as fallback when no reasoning parser is configured but the model
         produces thinking tags. This prevents tool parsing failures with
-        models that use thinking tags (e.g., Ring-Mini-Linear-2.0 with hermes).
+        models that use thinking tags (e.g., Ring-Mini-Linear-2.0 with hermes,
+        Gemma 4 with enable_thinking=True).
 
         Args:
             text: Model output that may contain think tags
@@ -90,13 +103,17 @@ class ToolParser(ABC):
         Returns:
             Text with think tags removed
         """
-        # First try to strip full tags
-        result = THINK_TAG_PATTERN.sub("", text)
+        # Strip Gemma 4 channel-style thought blocks first, as they can wrap
+        # or precede <think> tags and contain <|tool_call> envelope content.
+        result = GEMMA4_CHANNEL_THOUGHT_PATTERN.sub("", text)
 
-        # If no full tags found but </think> exists, strip implicit think
+        # Strip standard <think>...</think> full tags
+        result = THINK_TAG_PATTERN.sub("", result)
+
+        # If no full <think> tags found but </think> exists, strip implicit think
         # (when <think> was injected in the prompt)
         if result == text and "</think>" in text:
-            result = IMPLICIT_THINK_PATTERN.sub("", text)
+            result = IMPLICIT_THINK_PATTERN.sub("", result)
 
         return result.strip()
 

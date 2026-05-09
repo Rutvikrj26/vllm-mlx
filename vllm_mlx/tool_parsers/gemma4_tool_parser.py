@@ -266,3 +266,45 @@ class Gemma4ToolParser(ToolParser):
                 }
 
         return None
+
+
+if __name__ == "__main__":
+    # Inline smoke tests — run with: python -m vllm_mlx.tool_parsers.gemma4_tool_parser
+    parser = Gemma4ToolParser()
+
+    # Test 1: <think>...</think> block precedes tool call (standard thinking tag)
+    raw1 = (
+        "<think>I should use get_weather</think>"
+        '<|tool_call>call:get_weather{<|"|>location<|"|>: <|"|>London<|"|>}<tool_call|>'
+    )
+    r1 = parser.extract_tool_calls(raw1)
+    assert r1.tools_called, "Test 1 FAIL: tools_called should be True"
+    assert r1.tool_calls[0]["name"] == "get_weather", "Test 1 FAIL: wrong function name"
+    assert '"location"' in r1.tool_calls[0]["arguments"], "Test 1 FAIL: location missing"
+    print("Test 1 PASS: <think>...</think> stripped, get_weather extracted")
+
+    # Test 2: Gemma 4 channel-style thought block precedes tool call
+    raw2 = (
+        "<|channel>thought\nThe user is asking about weather in London. "
+        "I should call get_weather with location=London.<channel|>"
+        '<|tool_call>call:get_weather{<|"|>location<|"|>: <|"|>London<|"|>}<tool_call|>'
+    )
+    r2 = parser.extract_tool_calls(raw2)
+    assert r2.tools_called, "Test 2 FAIL: tools_called should be True"
+    assert r2.tool_calls[0]["name"] == "get_weather", "Test 2 FAIL: wrong function name"
+    print("Test 2 PASS: <|channel>thought\\n...<channel|> stripped, get_weather extracted")
+
+    # Test 3: No thinking tags — clean tool call (regression guard)
+    raw3 = '<|tool_call>call:get_weather{<|"|>location<|"|>: <|"|>Paris<|"|>}<tool_call|>'
+    r3 = parser.extract_tool_calls(raw3)
+    assert r3.tools_called, "Test 3 FAIL: tools_called should be True"
+    assert r3.tool_calls[0]["name"] == "get_weather", "Test 3 FAIL: wrong function name"
+    print("Test 3 PASS: clean tool call (no thinking tags) extracted correctly")
+
+    # Test 4: No tool call in output — should return tools_called=False
+    raw4 = "The weather in London is cloudy and 15C."
+    r4 = parser.extract_tool_calls(raw4)
+    assert not r4.tools_called, "Test 4 FAIL: tools_called should be False"
+    print("Test 4 PASS: plain text correctly returns tools_called=False")
+
+    print("\nAll tests passed.")
