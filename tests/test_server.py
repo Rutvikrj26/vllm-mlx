@@ -3571,7 +3571,7 @@ class TestChatCompletionStreamingModeSwitching:
 
         bound_thread = {"id": None}
 
-        def fake_bind_generation_streams():
+        def fake_bind_generation_streams(*_args, **_kwargs):
             bound_thread["id"] = threading.get_ident()
 
         class FakeLLMModel:
@@ -3779,7 +3779,7 @@ class TestChatCompletionStreamingModeSwitching:
 
         bound_thread = {"id": None}
 
-        def fake_bind_generation_streams():
+        def fake_bind_generation_streams(*_args, **_kwargs):
             bound_thread["id"] = threading.get_ident()
 
         class FakeLLMModel:
@@ -3896,7 +3896,7 @@ class TestChatCompletionStreamingModeSwitching:
         bound_thread = {"id": None}
         parser_init_threads: list[int] = []
 
-        def fake_bind_generation_streams():
+        def fake_bind_generation_streams(*_args, **_kwargs):
             bound_thread["id"] = threading.get_ident()
 
         class FakeParser:
