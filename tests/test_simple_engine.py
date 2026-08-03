@@ -2000,6 +2000,7 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+        tokenizer.encode.assert_not_called()
 
     @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
