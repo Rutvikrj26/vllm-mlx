@@ -2646,6 +2646,8 @@ class TestSimpleEngineNaturalStop:
 
         finished = [output for output in outputs if output.finished]
         assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].new_text == ""
         assert finished[0].finish_reason == "stop"
 
     @pytest.mark.anyio
@@ -2664,6 +2666,7 @@ class TestSimpleEngineNaturalStop:
 
         finished = [output for output in outputs if output.finished]
         assert len(finished) == 1
+        assert finished[0] is outputs[-1]
         assert finished[0].finish_reason == "length"
 
     @pytest.mark.anyio
