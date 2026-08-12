@@ -1,8 +1,8 @@
 # vllm-mlx
 
-**Read this in other languages:** [English](README.md) · [Español](README.es.md) · [Français](README.fr.md) · [中文](README.zh.md)
-
 **Continuous batching + OpenAI + Anthropic APIs in one server. Native Apple Silicon inference.**
+
+**Read this in other languages:** [English](README.md) · [Español](README.es.md) · [Français](README.fr.md) · [中文](README.zh.md)
 
 [![PyPI version](https://img.shields.io/pypi/v/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
 [![PyPI Downloads](https://static.pepy.tech/badge/vllm-mlx)](https://pepy.tech/projects/vllm-mlx)
