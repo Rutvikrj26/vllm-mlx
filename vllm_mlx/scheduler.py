@@ -15,6 +15,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
@@ -696,6 +697,28 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+@dataclass
+class _MTPStatsState:
+    """Cumulative native-MTP counters shared across generator instances."""
+
+    counters: Dict[str, int] = field(
+        default_factory=lambda: {
+            "attempted": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+        }
+    )
+    bypass_counts: Dict[str, int] = field(
+        default_factory=lambda: {
+            "prefill": 0,
+            "no_active_batch": 0,
+            "cache_mismatch": 0,
+        }
+    )
+    lock: Any = field(default_factory=Lock)
+
+
 def _configure_chunked_prefill(
     scheduler: "Scheduler",
     batch_gen: "BatchGenerator",
@@ -759,6 +782,7 @@ def _install_mtp(
     model: Any,
     num_draft_tokens: int = 1,
     optimistic: bool = False,
+    stats_state: Optional["_MTPStatsState"] = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
@@ -788,8 +812,54 @@ def _install_mtp(
     # Format: {uid: {'token': int, 'logprobs': mx.array}}
     _deferred_drafts = {}
 
-    # MTP stats
-    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
+    # Scheduler-created generators share one state so sampler-driven generator
+    # replacement does not reset the operator-facing counters.
+    if stats_state is None:
+        stats_state = _MTPStatsState()
+    _mtp_stats = stats_state.counters
+    _mtp_bypass_counts = stats_state.bypass_counts
+    _mtp_stats_lock = stats_state.lock
+
+    def _get_mtp_stats() -> Dict[str, Any]:
+        with _mtp_stats_lock:
+            attempted = _mtp_stats["attempted"]
+            accepted = _mtp_stats["accepted"]
+            rejected = _mtp_stats["rejected"]
+            errors = _mtp_stats["errors"]
+            bypass_counts = dict(_mtp_bypass_counts)
+        verified = accepted + rejected
+        return {
+            "enabled": True,
+            "requested_draft_tokens": num_draft_tokens,
+            "effective_draft_tokens": 1,
+            "mode": (
+                "always_advance_optimistic" if optimistic else "always_advance_verified"
+            ),
+            "attempted": attempted,
+            "accepted": accepted,
+            "rejected": rejected,
+            "errors": errors,
+            "acceptance_rate": accepted / verified if verified else 0.0,
+            "bypass_counts": bypass_counts,
+            "bypass_counts_semantics": "per_condition_overlapping_not_total_steps",
+        }
+
+    batch_gen.get_mtp_stats = _get_mtp_stats
+
+    def _mtp_bypass_reasons(input_tokens, prompt_cache):
+        reasons = []
+        if input_tokens.shape[1] > 1:
+            reasons.append("prefill")
+        if batch_gen.active_batch is None:
+            reasons.append("no_active_batch")
+        elif prompt_cache is not batch_gen.active_batch.cache:
+            reasons.append("cache_mismatch")
+        return reasons
+
+    def _record_mtp_bypass(reasons) -> None:
+        with _mtp_stats_lock:
+            for reason in reasons:
+                _mtp_bypass_counts[reason] += 1
 
     def _mtp_step(
         input_tokens,
@@ -821,11 +891,9 @@ def _install_mtp(
         # the cache doesn't belong to the active batch (e.g. during
         # _process_prompts in the 2nd+ iteration of _orig_next's loop
         # or during _chunked_next partial prefill finalization).
-        if (
-            input_tokens.shape[1] > 1
-            or batch_gen.active_batch is None
-            or prompt_cache is not batch_gen.active_batch.cache
-        ):
+        bypass_reasons = _mtp_bypass_reasons(input_tokens, prompt_cache)
+        if bypass_reasons:
+            _record_mtp_bypass(bypass_reasons)
             _skip_state[0] = None
             return _orig_step(
                 input_tokens,
@@ -897,6 +965,8 @@ def _install_mtp(
 
         # --- MTP draft + always-advance verify ---
         try:
+            with _mtp_stats_lock:
+                _mtp_stats["attempted"] += 1
             # Draft: predict token n+2 from hidden states + primary (n+1)
             draft_logits = model.mtp_forward(
                 hidden_states[:, -1:, :],
@@ -967,7 +1037,8 @@ def _install_mtp(
                         }
                 else:
                     _skip_state[0] = None
-                _mtp_stats["accepted"] += 1
+                with _mtp_stats_lock:
+                    _mtp_stats["accepted"] += 1
             else:
                 # --- VERIFIED MODE: single eval + Python comparison ---
                 verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
@@ -992,7 +1063,8 @@ def _install_mtp(
                             "token": draft_list[e],
                             "logprobs": verify_lp[e],
                         }
-                    _mtp_stats["accepted"] += 1
+                    with _mtp_stats_lock:
+                        _mtp_stats["accepted"] += 1
 
                 else:
                     # --- REJECT (always-advance) ---
@@ -1054,12 +1126,14 @@ def _install_mtp(
                             _skip_state[0] = None
                     for uid in current_uids:
                         _deferred_drafts.pop(uid, None)
-                    _mtp_stats["rejected"] += 1
+                    with _mtp_stats_lock:
+                        _mtp_stats["rejected"] += 1
 
         except Exception as e:
             logger.debug(f"[MTP] draft/verify failed: {e}")
             _skip_state[0] = None
-            _mtp_stats["errors"] += 1
+            with _mtp_stats_lock:
+                _mtp_stats["errors"] += 1
 
         return primary_tokens, list(logprobs)
 
@@ -1188,6 +1262,13 @@ def _install_mtp(
     )
 
 
+def _mtp_status_snapshot(batch_generator) -> Dict[str, Any]:
+    get_mtp_stats = getattr(batch_generator, "get_mtp_stats", None)
+    if callable(get_mtp_stats):
+        return {"mtp": get_mtp_stats()}
+    return {}
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1312,6 +1393,7 @@ class Scheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._mtp_stats_state = _MTPStatsState()
 
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
@@ -1446,6 +1528,7 @@ class Scheduler:
                     model=self.model,
                     num_draft_tokens=self.config.mtp_num_draft_tokens,
                     optimistic=self.config.mtp_optimistic,
+                    stats_state=self._mtp_stats_state,
                 )
             else:
                 logger.warning(
@@ -2745,6 +2828,7 @@ class Scheduler:
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
         }
+        stats.update(_mtp_status_snapshot(self.batch_generator))
         # Include Metal memory stats
         try:
             if mx.metal.is_available():
