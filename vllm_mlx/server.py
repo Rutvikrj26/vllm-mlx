@@ -155,7 +155,11 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -193,6 +197,10 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
+_embedding_max_length: int | None = (
+    None  # Set via --embedding-max-length ('auto' = None)
+)
+_embedding_overflow_policy: str = "truncate"  # Set via --embedding-overflow-policy
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
@@ -3165,7 +3173,11 @@ def load_embedding_model(
 
     from .embedding import EmbeddingEngine
 
-    _embedding_engine = EmbeddingEngine(model_name)
+    _embedding_engine = EmbeddingEngine(
+        model_name,
+        max_length_ceiling=_embedding_max_length,
+        overflow_policy=_embedding_overflow_policy,
+    )
     _embedding_engine.load()
 
 
@@ -3542,6 +3554,24 @@ async def health():
     return payload
 
 
+def _embedding_status() -> dict[str, object] | None:
+    """Effective embedding config, for status/config reporting."""
+    if _embedding_engine is None:
+        return None
+    return {
+        "model": _embedding_engine.model_name,
+        # The truncation length actually applied by embed() — resolved from
+        # the loaded model's config and clamped by max_length_ceiling below.
+        # A 512-token model with an 8192 ceiling still uses 512; reporting
+        # the ceiling itself here would be misleading in that case.
+        "max_length": _embedding_engine.effective_max_length,
+        # None means no operator ceiling is configured. This field is
+        # int | None, a single consistent type API consumers can rely on.
+        "max_length_ceiling": _embedding_max_length,
+        "overflow_policy": _embedding_overflow_policy,
+    }
+
+
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
@@ -3554,6 +3584,7 @@ async def status():
                 ),
                 "models": _model_manager.list_models(),
             },
+            "embedding": _embedding_status(),
         }
     lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
@@ -3562,6 +3593,7 @@ async def status():
             "model": _model_name,
             "residency": lifecycle,
             "requests": [],
+            "embedding": _embedding_status(),
         }
 
     stats = _engine.get_stats()
@@ -3573,6 +3605,7 @@ async def status():
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
         "residency": lifecycle,
+        "embedding": _embedding_status(),
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -3835,6 +3868,8 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     server startup.
     """
     global _embedding_engine
+    from .embedding import EmbeddingLengthExceededError
+
     tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
@@ -3886,6 +3921,18 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         )
         return response
 
+    except EmbeddingLengthExceededError as exc:
+        tracker.finish(result="error")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "embedding_input_too_long",
+                "message": str(exc),
+                "input_index": exc.text_index,
+                "token_count": exc.token_count,
+                "max_length": exc.max_length,
+            },
+        ) from exc
     except ImportError:
         tracker.finish(result="error")
         raise HTTPException(
@@ -6658,6 +6705,7 @@ def main():
     global _default_top_k, _default_min_p
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
+    global _embedding_max_length, _embedding_overflow_policy
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
@@ -6677,6 +6725,8 @@ def main():
         _default_repetition_penalty = args.default_repetition_penalty
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
+    _embedding_max_length = args.embedding_max_length
+    _embedding_overflow_policy = args.embedding_overflow_policy
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -6901,6 +6951,21 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
+    )
+    parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Maximum token length for embeddings: positive integer or 'auto' "
+            "(default: auto, use the model context length)"
+        ),
+    )
+    parser.add_argument(
+        "--embedding-overflow-policy",
+        choices=("truncate", "error"),
+        default="truncate",
+        help="How to handle embedding inputs over the effective maximum length",
     )
     parser.add_argument(
         "--default-temperature",
