@@ -985,6 +985,10 @@ _STREAMING_TOOL_MARKERS = (
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
+_STREAMING_BARE_JSON_MARKER = re.compile(r'^\s*\{\s*"(?:name|type)"\s*:')
+_STREAMING_BARE_JSON_PARTIAL = re.compile(
+    r'^\s*\{\s*"?(?:n(?:a(?:m(?:e)?)?)?|t(?:y(?:p(?:e)?)?)?)?"?\s*:?\s*$'
+)
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
@@ -1873,7 +1877,11 @@ def _parse_tool_calls_with_parser(
 
     request_dict = request.model_dump() if request else None
 
-    # tool_choice="none" means never return tool calls — skip all parsing
+    # Tool parsing is valid only when the request declares available tools.
+    if request is not None and not getattr(request, "tools", None):
+        return output_text, None
+
+    # tool_choice="none" means never return tool calls, so skip all parsing.
     if request is not None:
         tool_choice = getattr(request, "tool_choice", None)
         if tool_choice is None and request_dict:
@@ -2621,7 +2629,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             completion_tokens = output.completion_tokens
 
         delta_text = output.new_text or ""
-        if not delta_text:
+        if not delta_text and not output.finished:
             continue
 
         previous_text = raw_accumulated_text
@@ -2668,7 +2676,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             continue
 
         content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-        if tool_parser and delta_text:
+        if tool_parser and (delta_text or (output.finished and tool_markup_possible)):
             # Fast path: skip parsing until a tool-markup marker appears.
             # Use _streaming_tool_markup_possible to catch all supported
             # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
@@ -2677,7 +2685,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             if (
                 not tool_markup_possible
                 and not _streaming_tool_markup_possible_after_delta(
-                    tool_accumulated_text, delta_text
+                    tool_accumulated_text, delta_text, tool_parser
                 )
             ):
                 tool_accumulated_text += delta_text
@@ -2690,11 +2698,18 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     delta_text,
                     tool_request_context,
                 )
+                if tool_result is None and output.finished:
+                    tool_result = _finalize_streaming_tool_result(
+                        tool_parser, tool_accumulated_text
+                    )
                 if tool_result is None:
                     continue
                 if "tool_calls" in tool_result:
-                    continue
-                content = tool_result.get("content", "")
+                    content = tool_result.get("content", "")
+                    if not content:
+                        continue
+                else:
+                    content = tool_result.get("content", "")
 
         if not content:
             continue
@@ -3052,6 +3067,8 @@ def _get_streaming_tool_parser(
     """
     if request is None:
         return None
+    if not getattr(request, "tools", None):
+        return None
     if _tool_choice_disabled(request):
         return None
 
@@ -3066,9 +3083,6 @@ def _get_streaming_tool_parser(
                 _sanitize_log_text(e, limit=500),
             )
             return None
-
-    if not getattr(request, "tools", None):
-        return None
 
     try:
         parser_cls = ToolParserManager.get_tool_parser("auto")
@@ -3125,17 +3139,29 @@ def _parse_streaming_tool_content(
     return accumulated_text, result, suppress
 
 
-def _streaming_tool_markup_possible(text: str) -> bool:
+def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
     """Heuristic marker check to avoid parser work on ordinary text chunks."""
+    parser_markers = getattr(tool_parser, "STREAMING_MARKERS", ())
+    supports_bare_json = bool(
+        getattr(tool_parser, "SUPPORTS_BARE_JSON_STREAMING", False)
+    )
     return (
         any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or any(marker in text for marker in parser_markers)
         or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
         or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
+        or (
+            supports_bare_json
+            and (
+                _STREAMING_BARE_JSON_MARKER.search(text) is not None
+                or _STREAMING_BARE_JSON_PARTIAL.search(text) is not None
+            )
+        )
     )
 
 
 def _streaming_tool_markup_possible_after_delta(
-    accumulated_text: str, delta_text: str
+    accumulated_text: str, delta_text: str, tool_parser=None
 ) -> bool:
     """
     Check only the boundary window needed to detect newly appearing tool markup.
@@ -3149,7 +3175,15 @@ def _streaming_tool_markup_possible_after_delta(
     if not delta_text:
         return False
     check_text = accumulated_text[-_STREAMING_TOOL_MARKUP_SCAN_CHARS:] + delta_text
-    return _streaming_tool_markup_possible(check_text)
+    return _streaming_tool_markup_possible(check_text, tool_parser)
+
+
+def _finalize_streaming_tool_result(tool_parser, current_text: str):
+    """Let parsers resolve an ambiguous prefix at end of generation."""
+    finalize = getattr(tool_parser, "finalize_streaming", None)
+    if finalize is None:
+        return None
+    return finalize(current_text)
 
 
 def load_embedding_model(
@@ -5868,12 +5902,12 @@ async def _stream_anthropic_messages(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if not delta_text:
+            if not delta_text and not output.finished:
                 continue
 
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered:
+            if not filtered and not output.finished:
                 continue
 
             if not use_reasoning:
@@ -5885,18 +5919,20 @@ async def _stream_anthropic_messages(
                 # must see the raw delta (harmony control tokens intact) so a
                 # gpt-oss commentary block can activate the gate; only the
                 # emitted text stays SPECIAL_TOKENS-stripped.
-                if tool_parser and delta_text:
+                if tool_parser and (
+                    delta_text or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, delta_text
+                            tool_accumulated_text, delta_text, tool_parser
                         )
                     ):
                         tool_accumulated_text += delta_text
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                        tool_accumulated_text, tool_result, _ = (
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
@@ -5904,8 +5940,12 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if suppress_tool_text:
-                            # Inside tool markup or tool calls detected — suppress
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -5939,18 +5979,20 @@ async def _stream_anthropic_messages(
                 content_to_emit = delta_msg.content
 
                 # Filter tool call markup during streaming
-                if tool_parser and content_to_emit:
+                if tool_parser and (
+                    content_to_emit or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit
+                            tool_accumulated_text, content_to_emit, tool_parser
                         )
                     ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                        tool_accumulated_text, tool_result, _ = (
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
@@ -5958,8 +6000,12 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if suppress_tool_text:
-                            # Inside tool markup or tool calls detected — suppress
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -6247,7 +6293,7 @@ async def stream_chat_completion(
                 # to the content stream so the tool parser can handle it.
                 if tool_parser and reasoning and not content:
                     _check = tool_accumulated_text + reasoning
-                    if _streaming_tool_markup_possible(_check):
+                    if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
                         reasoning = None
 
@@ -6256,7 +6302,7 @@ async def stream_chat_completion(
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content
+                            tool_accumulated_text, content, tool_parser
                         )
                     ):
                         tool_accumulated_text += content
@@ -6272,6 +6318,11 @@ async def stream_chat_completion(
                                 tool_request_context,
                             )
                         )
+
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress content output
@@ -6311,6 +6362,7 @@ async def stream_chat_completion(
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
                                             tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
                                         finish_reason=(
@@ -6381,7 +6433,9 @@ async def stream_chat_completion(
                     think_prefix_sent = True
 
                 # Tool call streaming parsing
-                if tool_parser and delta_text:
+                if tool_parser and (
+                    delta_text or (output.finished and tool_markup_possible)
+                ):
                     # Fast path: skip full parsing until likely tool markup appears.
                     # This preserves the cheap path for ordinary text while still
                     # allowing generic streaming tool parsing when no explicit
@@ -6389,7 +6443,7 @@ async def stream_chat_completion(
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, delta_text
+                            tool_accumulated_text, delta_text, tool_parser
                         )
                     ):
                         tool_accumulated_text += delta_text
@@ -6405,6 +6459,11 @@ async def stream_chat_completion(
                                 tool_request_context,
                             )
                         )
+
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress output
@@ -6427,7 +6486,8 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"]
+                                            tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(
                                             "tool_calls" if output.finished else None
@@ -6491,7 +6551,7 @@ async def stream_chat_completion(
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
-            and _streaming_tool_markup_possible(tool_accumulated_text)
+            and _streaming_tool_markup_possible(tool_accumulated_text, tool_parser)
         ):
             final_parse_result = tool_parser.extract_tool_calls(
                 tool_accumulated_text, tool_request_context

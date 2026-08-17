@@ -2262,6 +2262,190 @@ class TestStreamChatCompletion:
         assert delta.get("content") is None
         assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
 
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("model_chunks", "expected_content"),
+        [
+            (
+                [
+                    "<|python_tag|>",
+                    '{"name": "read", ',
+                    '"parameters": {"file_path": "/tmp/test.py"}}',
+                ],
+                "",
+            ),
+            (
+                [
+                    "{",
+                    '"type": "function", "name": "read", ',
+                    '"parameters": {"file_path": "/tmp/test.py"}}',
+                ],
+                "",
+            ),
+            (
+                [
+                    "Before <|python_tag|>"
+                    '{"name": "read", "parameters": '
+                    '{"file_path": "/tmp/test.py"}} After'
+                ],
+                "Before  After",
+            ),
+        ],
+        ids=["python-tag", "bare-json", "content-and-python-tag"],
+    )
+    async def test_llama_formats_stream_through_server_gate(
+        self, monkeypatch, model_chunks, expected_content
+    ):
+        """Llama formats must reach the parser without leaking raw JSON."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        from vllm_mlx.tool_parsers.llama_tool_parser import LlamaToolParser
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                for index, model_chunk in enumerate(model_chunks):
+                    is_last = index == len(model_chunks) - 1
+                    yield GenerationOutput(
+                        text="",
+                        new_text=model_chunk,
+                        finished=is_last,
+                        finish_reason="stop" if is_last else None,
+                        prompt_tokens=4 if is_last else 0,
+                        completion_tokens=3 if is_last else 0,
+                    )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "llama")
+        monkeypatch.setattr(server, "_tool_parser_instance", LlamaToolParser())
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+        content = "".join(
+            payload["choices"][0]["delta"].get("content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+
+        assert len(tool_payloads) == 1
+        tool_call = tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]
+        assert tool_call["function"]["name"] == "read"
+        assert tool_call["function"]["arguments"] == ('{"file_path": "/tmp/test.py"}')
+        assert content == expected_content
+        assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.anyio
+    async def test_incomplete_llama_json_is_flushed_at_end_of_stream(self, monkeypatch):
+        """An ambiguous final JSON prefix must remain assistant content."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        from vllm_mlx.tool_parsers import LlamaToolParser
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text="{",
+                    finished=False,
+                )
+                yield GenerationOutput(
+                    text="",
+                    new_text="",
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tokens=4,
+                    completion_tokens=1,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "llama")
+        monkeypatch.setattr(server, "_tool_parser_instance", LlamaToolParser())
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="Return JSON")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        choices = [payload["choices"][0] for payload in payloads if payload["choices"]]
+
+        assert (
+            "".join(choice["delta"].get("content") or "" for choice in choices) == "{"
+        )
+        assert choices[-1]["finish_reason"] == "length"
+
     def test_streaming_tool_markup_precheck_uses_bounded_boundary(self):
         """Pre-marker checks should not need the full accumulated stream."""
         import vllm_mlx.server as server
@@ -2276,6 +2460,33 @@ class TestStreamChatCompletion:
         )
         assert server._streaming_tool_markup_possible_after_delta(
             long_prefix + "[read(", '{"file_path": "/tmp/test.py"}'
+        )
+
+    def test_streaming_tool_markup_precheck_detects_llama_json_prefixes(self):
+        """The server gate must buffer only viable Llama bare-JSON prefixes."""
+        import vllm_mlx.server as server
+        from vllm_mlx.tool_parsers import LlamaToolParser
+
+        parser = LlamaToolParser()
+        assert server._streaming_tool_markup_possible_after_delta("", "{", parser)
+        assert server._streaming_tool_markup_possible_after_delta("{", '"na', parser)
+        assert server._streaming_tool_markup_possible_after_delta(
+            '{"na', 'me": "read_file",', parser
+        )
+        assert server._streaming_tool_markup_possible_after_delta(
+            "", '  {"type": "function",', parser
+        )
+        assert not server._streaming_tool_markup_possible_after_delta(
+            "", '{"value": 42}', parser
+        )
+
+    def test_streaming_tool_markup_precheck_detects_split_python_tag(self):
+        """The server gate must recognize python-tag across delta boundaries."""
+        import vllm_mlx.server as server
+        from vllm_mlx.tool_parsers import LlamaToolParser
+
+        assert server._streaming_tool_markup_possible_after_delta(
+            "<|python_", 'tag|>{"name": "read_file"}', LlamaToolParser()
         )
 
     @pytest.mark.anyio
@@ -2338,7 +2549,6 @@ class TestStreamChatCompletion:
             def extract_tool_calls_streaming(
                 self, previous_text, current_text, delta_text, request=None
             ):
-                assert request == {"tools": []}
                 if "</tool_call>" in current_text:
                     return {
                         "tool_calls": [
@@ -2364,6 +2574,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search for information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                            "required": ["q"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -2559,6 +2783,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search for information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                            "required": ["q"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -2808,6 +3046,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -4028,6 +4280,19 @@ class TestChatCompletionStreamingModeSwitching:
                 json={
                     "model": "test-model",
                     "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "count",
+                                "description": "Count values",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            },
+                        }
+                    ],
                     "max_tokens": 30,
                     "temperature": 0,
                     "stream": True,
