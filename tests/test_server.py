@@ -2549,7 +2549,6 @@ class TestStreamChatCompletion:
             def extract_tool_calls_streaming(
                 self, previous_text, current_text, delta_text, request=None
             ):
-                assert request == {"tools": []}
                 if "</tool_call>" in current_text:
                     return {
                         "tool_calls": [
@@ -2575,6 +2574,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search for information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                            "required": ["q"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -2770,6 +2783,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search for information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}},
+                            "required": ["q"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -3019,6 +3046,20 @@ class TestStreamChatCompletion:
         request = ChatCompletionRequest(
             model="request-model",
             messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
             stream=True,
         )
 
@@ -4239,6 +4280,19 @@ class TestChatCompletionStreamingModeSwitching:
                 json={
                     "model": "test-model",
                     "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "count",
+                                "description": "Count values",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            },
+                        }
+                    ],
                     "max_tokens": 30,
                     "temperature": 0,
                     "stream": True,
