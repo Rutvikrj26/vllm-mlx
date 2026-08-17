@@ -118,6 +118,9 @@ class RegistryServeDefaults:
     specprefill_keep_pct: float
     specprefill_backbone_pct: float
     specprefill_draft_model: str | None
+    prefix_trie_cache: bool
+    prefix_trie_cache_size: int
+    prefix_trie_cache_memory_mb: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
@@ -158,6 +161,9 @@ class RegisteredModel:
     specprefill_keep_pct: float | None = None
     specprefill_backbone_pct: float | None = None
     specprefill_draft_model: str | None = None
+    prefix_trie_cache: bool | None = None
+    prefix_trie_cache_size: int | None = None
+    prefix_trie_cache_memory_mb: int | None = None
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
     estimated_memory_bytes: int | None = None
@@ -178,6 +184,9 @@ class ResolvedModelConfig:
     specprefill_keep_pct: float
     specprefill_backbone_pct: float
     specprefill_draft_model: str | None
+    prefix_trie_cache: bool
+    prefix_trie_cache_size: int
+    prefix_trie_cache_memory_mb: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
@@ -611,6 +620,9 @@ def load_registry_config(
             specprefill_keep_pct=item.get("specprefill_keep_pct"),
             specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
+            prefix_trie_cache=item.get("prefix_trie_cache"),
+            prefix_trie_cache_size=item.get("prefix_trie_cache_size"),
+            prefix_trie_cache_memory_mb=item.get("prefix_trie_cache_memory_mb"),
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=gpu_memory_utilization,
             estimated_memory_bytes=estimated_bytes,
@@ -1061,6 +1073,9 @@ class ModelManager:
                 specprefill_keep_pct=config.specprefill_keep_pct,
                 specprefill_backbone_pct=config.specprefill_backbone_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
+                prefix_trie_cache=config.prefix_trie_cache,
+                prefix_trie_cache_size=config.prefix_trie_cache_size,
+                prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
             )
 
         await engine.start()
@@ -1164,6 +1179,21 @@ class ModelManager:
             if entry.specprefill_draft_model is not None
             else self._defaults.specprefill_draft_model
         )
+        prefix_trie_cache = (
+            entry.prefix_trie_cache
+            if entry.prefix_trie_cache is not None
+            else self._defaults.prefix_trie_cache
+        )
+        prefix_trie_cache_size = (
+            entry.prefix_trie_cache_size
+            if entry.prefix_trie_cache_size is not None
+            else self._defaults.prefix_trie_cache_size
+        )
+        prefix_trie_cache_memory_mb = (
+            entry.prefix_trie_cache_memory_mb
+            if entry.prefix_trie_cache_memory_mb is not None
+            else self._defaults.prefix_trie_cache_memory_mb
+        )
         stream_interval = (
             entry.stream_interval
             if entry.stream_interval is not None
@@ -1188,6 +1218,9 @@ class ModelManager:
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
             scheduler_config=scheduler_config,
