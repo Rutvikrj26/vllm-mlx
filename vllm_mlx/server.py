@@ -87,6 +87,7 @@ from .api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -105,6 +106,7 @@ from .api.models import (
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.prompt_canonicalize import canonicalize_system_messages
 from .api.responses_models import (
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
@@ -131,7 +133,9 @@ from .api.responses_models import (
     ResponsesUsage,
 )
 from .api.tool_calling import (
+    InvalidResponseFormatOutput,
     StreamingJsonFenceStripper,
+    apply_response_format_or_error,
     build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -158,7 +162,7 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import suspend_cancellation
+from .engine.base import EngineBusy, suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -302,6 +306,7 @@ class PreparedChatInvocation:
     chat_kwargs: dict[str, object]
     response_format: object | None
     json_logits_processor: object | None
+    thinking_processor: object | None = None
 
 
 def _prepare_chat_messages(
@@ -349,6 +354,8 @@ def _prepare_chat_messages(
             preserve_native_format=preserve_native,
         )
         messages = _normalize_messages(messages)
+
+    messages = canonicalize_system_messages(messages)
 
     has_media = bool(images or videos or audios)
     if is_mllm and not has_media:
@@ -505,6 +512,18 @@ def _build_thinking_processor(
 
     vocab_size = getattr(tokenizer, "vocab_size", 152064)
 
+    no_final_content_token_limit = _resolve_no_final_content_token_limit()
+    if (
+        no_final_content_token_limit is not None
+        and no_final_content_token_limit >= thinking_token_budget
+    ):
+        logger.warning(
+            "VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%d will not fire because "
+            "thinking_token_budget=%d is reached first",
+            no_final_content_token_limit,
+            thinking_token_budget,
+        )
+
     proc = ThinkingAwareLogitsProcessor(
         start_token_ids=start_ids,
         end_token_ids=end_ids,
@@ -512,6 +531,7 @@ def _build_thinking_processor(
         inner=inner,
         vocab_size=vocab_size,
         prompt_has_think_tag=prompt_has_think_tag,
+        no_final_content_token_limit=no_final_content_token_limit,
     )
     logger.info(
         "Thinking processor enabled: budget=%d, start=%s, end=%s",
@@ -520,6 +540,35 @@ def _build_thinking_processor(
         end_ids,
     )
     return proc
+
+
+def _resolve_no_final_content_token_limit() -> int | None:
+    raw = os.environ.get("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%r", raw)
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _generation_metadata(
+    thinking_processor: object | None,
+) -> GenerationMetadata | None:
+    if thinking_processor is None:
+        return None
+    return GenerationMetadata(
+        no_final_content_watchdog_tokens=getattr(
+            thinking_processor, "_no_final_content_token_limit", None
+        ),
+        no_final_content_watchdog_enforced=bool(
+            getattr(thinking_processor, "watchdog_was_enforced", False)
+        ),
+    )
 
 
 class _ThinkingAwareLogitsProcessor:
@@ -636,6 +685,53 @@ class _ThinkingAwareLogitsProcessor:
         return self._inner._disabled
 
 
+def _attach_response_format_logits_processor(
+    chat_kwargs: dict, json_logits_processor: object
+) -> object:
+    """Attach response_format constraints and keep thinking disabled.
+
+    response_format content must be constrained from the first generated token.
+    If the processor is hidden behind thinking-state handling, direct JSON
+    emissions can bypass the constraint and run until max_tokens.
+    """
+
+    chat_kwargs["enable_thinking"] = False
+    if "chat_template_kwargs" in chat_kwargs:
+        chat_kwargs["chat_template_kwargs"] = dict(chat_kwargs["chat_template_kwargs"])
+        chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+    existing = chat_kwargs.get("logits_processors") or []
+    chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+    return json_logits_processor
+
+
+def _coerce_logit_bias(logit_bias: dict[str, float]) -> dict[int, float]:
+    coerced: dict[int, float] = {}
+    for token_id, bias in logit_bias.items():
+        try:
+            coerced[int(token_id)] = float(bias)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"logit_bias token id must be an integer string: {token_id!r}",
+            ) from exc
+    return coerced
+
+
+def _attach_logit_bias_processor(
+    chat_kwargs: dict, logit_bias: dict[str, float] | None
+):
+    if not logit_bias:
+        return
+
+    from mlx_lm.sample_utils import make_logits_processors
+
+    processors = make_logits_processors(logit_bias=_coerce_logit_bias(logit_bias))
+    if processors:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + list(processors)
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -664,6 +760,7 @@ def _prepare_chat_completion_invocation(
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
+    _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -679,6 +776,9 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
+    if specprefill_backbone_pct is not None:
+        chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )
@@ -705,39 +805,16 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        # Determine the *effective* thinking state: the request field, the
-        # resolved chat_template_kwargs, or the server default can all inject
-        # ``<think>`` into the rendered prompt independently.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            # User explicitly requested thinking with constrained decoding
-            # (via top-level enable_thinking or chat_template_kwargs).
-            # Wrap the processor so the enforcer only activates after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            # Suppress thinking so the model goes straight to JSON.
-            # The template injects an empty <think></think> block and the
-            # enforcer constrains output from the first token onward.
-            # Force both top-level and chat_template_kwargs to prevent the
-            # Jinja template from rendering an open <think> block.
-            request.enable_thinking = False
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
     # default budget should not alter non-thinking requests.
     thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
     enable_thinking = chat_kwargs.get("enable_thinking", True)
+    thinking_proc = None
     if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
             engine,
@@ -748,13 +825,21 @@ def _prepare_chat_completion_invocation(
         if thinking_proc is not None:
             # Replace the logits_processors list: the thinking processor wraps
             # the JSON processor as its inner delegate, so we don't double-add.
-            chat_kwargs["logits_processors"] = [thinking_proc]
+            existing_processors = list(chat_kwargs.get("logits_processors") or [])
+            if (
+                json_logits_processor is not None
+                and existing_processors
+                and existing_processors[-1] is json_logits_processor
+            ):
+                existing_processors = existing_processors[:-1]
+            chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
 
     return PreparedChatInvocation(
         messages=messages,
         chat_kwargs=chat_kwargs,
         response_format=response_format,
         json_logits_processor=json_logits_processor,
+        thinking_processor=thinking_proc,
     )
 
 
@@ -801,23 +886,9 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
-        # Same logic as the OpenAI path: check both top-level and
-        # chat_template_kwargs for an explicit thinking request.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     return PreparedChatInvocation(
         messages=messages,
@@ -886,14 +957,13 @@ _STREAMING_TOOL_MARKERS = (
     "[TOOL_CALLS]",
     "<minimax:tool_call>",
     '<invoke name="',
-    # Llama 3.1+/4 emit tool calls as <|python_tag|>{...}; gate streaming
-    # dispatch on the special token. Bare-JSON ({...}) Llama 3.3 calls are
-    # not gated here (a leading "{" is too ambiguous to match safely) and so
-    # only resolve in non-streaming mode.
-    "<|python_tag|>",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
+_STREAMING_BARE_JSON_MARKER = re.compile(r'^\s*\{\s*"(?:name|type)"\s*:')
+_STREAMING_BARE_JSON_PARTIAL = re.compile(
+    r'^\s*\{\s*"?(?:n(?:a(?:m(?:e)?)?)?|t(?:y(?:p(?:e)?)?)?)?"?\s*:?\s*$'
+)
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
@@ -943,6 +1013,17 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+def _raise_engine_busy(exc: EngineBusy) -> None:
+    """Translate serialized-engine admission failures into retryable HTTP 503."""
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": exc.code,
+            "message": str(exc),
+        },
+    ) from exc
 
 
 @dataclass
@@ -1165,6 +1246,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_enabled=spec.specprefill_enabled,
         specprefill_threshold=spec.specprefill_threshold,
         specprefill_keep_pct=spec.specprefill_keep_pct,
+        specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
     )
@@ -1710,7 +1792,11 @@ def _parse_tool_calls_with_parser(
 
     request_dict = request.model_dump() if request else None
 
-    # tool_choice="none" means never return tool calls — skip all parsing
+    # Tool parsing is valid only when the request declares available tools.
+    if request is not None and not getattr(request, "tools", None):
+        return output_text, None
+
+    # tool_choice="none" means never return tool calls, so skip all parsing.
     if request is not None:
         tool_choice = getattr(request, "tool_choice", None)
         if tool_choice is None and request_dict:
@@ -1756,13 +1842,75 @@ def _parse_tool_calls_with_parser(
                 for tc in result.tool_calls
             ]
             return result.content or "", tool_calls
-        else:
-            # Fallback: specific parser didn't find tool calls,
-            # try generic parser which handles more formats (e.g. Nemotron XML)
-            return parse_tool_calls(output_text, request_dict)
+
+        # Specific parser didn't find any tool calls. Try the generic parser
+        # which handles additional formats (e.g. Nemotron XML).
+        fallback_text, fallback_calls = parse_tool_calls(output_text, request_dict)
+        if fallback_calls:
+            return fallback_text, fallback_calls
+
+        # Neither parser found tool calls. Prefer the specific parser's cleaned
+        # content (which may have stripped truncated tool-call markup left by
+        # max_tokens cut-offs) over the raw model output. Falling back to the
+        # raw text here leaks partial <tool_call>/<function= markup into the
+        # response `content` when generation was cut mid-tool-call.
+        if result.content is not None:
+            return result.content, None
+        return fallback_text, None
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
+
+
+def _apply_response_format_or_raise(
+    text: str,
+    response_format: object,
+    *,
+    ensure_ascii: bool = False,
+) -> str:
+    """Return validated JSON content or fail before returning a success response."""
+    try:
+        text = apply_response_format_or_error(
+            text, response_format, ensure_ascii=ensure_ascii
+        )
+    except InvalidResponseFormatOutput as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_response_format_output",
+                "message": exc.message,
+            },
+        ) from exc
+    return _strip_backslash_before_unicode(text)
+
+
+def _response_format_type(response_format: object | None) -> str | None:
+    if response_format is None:
+        return None
+    if isinstance(response_format, dict):
+        return response_format.get("type")
+    return getattr(response_format, "type", None)
+
+
+def _promote_streaming_response_format_delta(
+    content: str | None,
+    reasoning: str | None,
+    request: ChatCompletionRequest,
+) -> tuple[str | None, str | None]:
+    """Keep response_format JSON on the streaming content channel.
+
+    Some thinking parsers classify direct JSON output as reasoning when the
+    model emits JSON without an explicit reasoning end marker.  For
+    response_format requests, that JSON is the final assistant content.
+    """
+    if content or not reasoning:
+        return content, reasoning
+    if _response_format_type(getattr(request, "response_format", None)) in (
+        "json_object",
+        "json_schema",
+    ):
+        return reasoning, None
+    return content, reasoning
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -2176,6 +2324,7 @@ def _prepare_responses_request(
         chat_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
@@ -2382,29 +2531,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     if _reasoning_parser:
         _reasoning_parser.reset_state()
 
-    global _tool_parser_instance
-    tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    if _enable_auto_tool_choice and _tool_call_parser:
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(
-                    "Initialized tool call parser for responses streaming: %s",
-                    _tool_call_parser,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to init tool parser for responses streaming: %s", e
-                )
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_parser = _get_streaming_tool_parser(chat_request, engine)
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2415,7 +2544,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             completion_tokens = output.completion_tokens
 
         delta_text = output.new_text or ""
-        if not delta_text:
+        if not delta_text and not output.finished:
             continue
 
         previous_text = raw_accumulated_text
@@ -2462,7 +2591,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             continue
 
         content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-        if tool_parser and delta_text:
+        if tool_parser and (delta_text or (output.finished and tool_markup_possible)):
             # Fast path: skip parsing until a tool-markup marker appears.
             # Use _streaming_tool_markup_possible to catch all supported
             # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
@@ -2471,7 +2600,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             if (
                 not tool_markup_possible
                 and not _streaming_tool_markup_possible_after_delta(
-                    tool_accumulated_text, delta_text
+                    tool_accumulated_text, delta_text, tool_parser
                 )
             ):
                 tool_accumulated_text += delta_text
@@ -2484,11 +2613,18 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     delta_text,
                 )
                 tool_accumulated_text += delta_text
+                if tool_result is None and output.finished:
+                    tool_result = _finalize_streaming_tool_result(
+                        tool_parser, tool_accumulated_text
+                    )
                 if tool_result is None:
                     continue
                 if "tool_calls" in tool_result:
-                    continue
-                content = tool_result.get("content", "")
+                    content = tool_result.get("content", "")
+                    if not content:
+                        continue
+                else:
+                    content = tool_result.get("content", "")
 
         if not content:
             continue
@@ -2789,6 +2925,8 @@ def _get_streaming_tool_parser(
 
     if request is None:
         return None
+    if not getattr(request, "tools", None):
+        return None
     if _tool_choice_disabled(request):
         return None
 
@@ -2807,9 +2945,6 @@ def _get_streaming_tool_parser(
         _tool_parser_instance.reset()
         return _tool_parser_instance
 
-    if not getattr(request, "tools", None):
-        return None
-
     try:
         parser_cls = ToolParserManager.get_tool_parser("auto")
         parser = parser_cls(tokenizer)
@@ -2820,17 +2955,29 @@ def _get_streaming_tool_parser(
         return None
 
 
-def _streaming_tool_markup_possible(text: str) -> bool:
+def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
     """Heuristic marker check to avoid parser work on ordinary text chunks."""
+    parser_markers = getattr(tool_parser, "STREAMING_MARKERS", ())
+    supports_bare_json = bool(
+        getattr(tool_parser, "SUPPORTS_BARE_JSON_STREAMING", False)
+    )
     return (
         any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or any(marker in text for marker in parser_markers)
         or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
         or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
+        or (
+            supports_bare_json
+            and (
+                _STREAMING_BARE_JSON_MARKER.search(text) is not None
+                or _STREAMING_BARE_JSON_PARTIAL.search(text) is not None
+            )
+        )
     )
 
 
 def _streaming_tool_markup_possible_after_delta(
-    accumulated_text: str, delta_text: str
+    accumulated_text: str, delta_text: str, tool_parser=None
 ) -> bool:
     """
     Check only the boundary window needed to detect newly appearing tool markup.
@@ -2844,7 +2991,15 @@ def _streaming_tool_markup_possible_after_delta(
     if not delta_text:
         return False
     check_text = accumulated_text[-_STREAMING_TOOL_MARKUP_SCAN_CHARS:] + delta_text
-    return _streaming_tool_markup_possible(check_text)
+    return _streaming_tool_markup_possible(check_text, tool_parser)
+
+
+def _finalize_streaming_tool_result(tool_parser, current_text: str):
+    """Let parsers resolve an ambiguous prefix at end of generation."""
+    finalize = getattr(tool_parser, "finalize_streaming", None)
+    if finalize is None:
+        return None
+    return finalize(current_text)
 
 
 def load_embedding_model(
@@ -2919,6 +3074,7 @@ def load_model(
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
+    specprefill_backbone_pct: float = 0.0,
     specprefill_draft_model: str = None,
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
@@ -2944,6 +3100,7 @@ def load_model(
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+        specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
         mllm_draft_model: Optional MLLM speculative draft/assistant model path.
         mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
@@ -3040,6 +3197,7 @@ def load_model(
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
         )
         _residency_manager = ResidencyManager(
@@ -3091,6 +3249,7 @@ def load_model(
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
             max_kv_size=_max_kv,
             mllm_draft_model=mllm_draft_model,
@@ -4533,6 +4692,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
                 generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+            specprefill_backbone_pct = getattr(
+                request, "specprefill_backbone_pct", None
+            )
+            if specprefill_backbone_pct is not None:
+                generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
             try:
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
@@ -4546,6 +4710,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
+            except EngineBusy as exc:
+                tracker.finish(result="busy")
+                _raise_engine_busy(exc)
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -4724,6 +4891,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -4744,20 +4914,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                # Return JSON as string
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
-                        "Constrained decoding produced invalid JSON: %s", error
+                        "Constrained decoding produced invalid JSON: %s", exc.detail
                     )
                 else:
-                    logger.warning(f"JSON validation failed: {error}")
+                    logger.warning("JSON validation failed: %s", exc.detail)
+                raise
 
         # Determine finish reason
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -4786,6 +4956,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
+            generation_metadata=_generation_metadata(prepared.thinking_processor),
         )
     finally:
         if release_on_exit:
@@ -5172,22 +5343,23 @@ async def create_anthropic_message(
 
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
-                        error,
+                        exc.detail,
                     )
                 else:
                     logger.warning(
-                        "JSON validation failed on Anthropic endpoint: %s", error
+                        "JSON validation failed on Anthropic endpoint: %s", exc.detail
                     )
+                raise
 
         # Clean output text
         final_content = None
@@ -5486,12 +5658,12 @@ async def _stream_anthropic_messages(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if not delta_text:
+            if not delta_text and not output.finished:
                 continue
 
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered:
+            if not filtered and not output.finished:
                 continue
 
             if not use_reasoning:
@@ -5500,11 +5672,13 @@ async def _stream_anthropic_messages(
                 content_to_emit = filtered
 
                 # Filter tool call markup during streaming
-                if tool_parser and content_to_emit:
+                if tool_parser and (
+                    content_to_emit or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit
+                            tool_accumulated_text, content_to_emit, tool_parser
                         )
                     ):
                         tool_accumulated_text += content_to_emit
@@ -5516,8 +5690,12 @@ async def _stream_anthropic_messages(
                         tool_result = tool_parser.extract_tool_calls_streaming(
                             tool_previous, tool_accumulated_text, content_to_emit
                         )
-                        if tool_result is None or "tool_calls" in tool_result:
-                            # Inside tool markup or tool calls detected — suppress
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -5550,11 +5728,13 @@ async def _stream_anthropic_messages(
                 content_to_emit = delta_msg.content
 
                 # Filter tool call markup during streaming
-                if tool_parser and content_to_emit:
+                if tool_parser and (
+                    content_to_emit or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit
+                            tool_accumulated_text, content_to_emit, tool_parser
                         )
                     ):
                         tool_accumulated_text += content_to_emit
@@ -5566,8 +5746,12 @@ async def _stream_anthropic_messages(
                         tool_result = tool_parser.extract_tool_calls_streaming(
                             tool_previous, tool_accumulated_text, content_to_emit
                         )
-                        if tool_result is None or "tool_calls" in tool_result:
-                            # Inside tool markup or tool calls detected — suppress
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -5694,6 +5878,9 @@ async def stream_completion(
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
+    if specprefill_backbone_pct is not None:
+        generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
@@ -5857,6 +6044,9 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                content, reasoning = _promote_streaming_response_format_delta(
+                    content, reasoning, request
+                )
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
@@ -5877,7 +6067,7 @@ async def stream_chat_completion(
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content
+                            tool_accumulated_text, content, tool_parser
                         )
                     ):
                         tool_accumulated_text += content
@@ -5890,6 +6080,11 @@ async def stream_chat_completion(
                         tool_result = tool_parser.extract_tool_calls_streaming(
                             tool_previous, tool_accumulated_text, content
                         )
+
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress content output
@@ -5929,6 +6124,7 @@ async def stream_chat_completion(
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
                                             tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
                                         finish_reason=(
@@ -5988,7 +6184,9 @@ async def stream_chat_completion(
                     think_prefix_sent = True
 
                 # Tool call streaming parsing
-                if tool_parser and delta_text:
+                if tool_parser and (
+                    delta_text or (output.finished and tool_markup_possible)
+                ):
                     # Fast path: skip full parsing until likely tool markup appears.
                     # This preserves the cheap path for ordinary text while still
                     # allowing generic streaming tool parsing when no explicit
@@ -5996,7 +6194,7 @@ async def stream_chat_completion(
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, delta_text
+                            tool_accumulated_text, delta_text, tool_parser
                         )
                     ):
                         tool_accumulated_text += delta_text
@@ -6009,6 +6207,11 @@ async def stream_chat_completion(
                         tool_result = tool_parser.extract_tool_calls_streaming(
                             tool_previous, tool_accumulated_text, delta_text
                         )
+
+                        if tool_result is None and output.finished:
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress output
@@ -6031,7 +6234,8 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"]
+                                            tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(
                                             "tool_calls" if output.finished else None
@@ -6082,7 +6286,7 @@ async def stream_chat_completion(
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
-            and _streaming_tool_markup_possible(tool_accumulated_text)
+            and _streaming_tool_markup_possible(tool_accumulated_text, tool_parser)
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:
