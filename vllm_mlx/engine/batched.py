@@ -14,8 +14,10 @@ LLM engine), so text-only requests must also be routed through it.
 import asyncio
 import inspect
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -29,6 +31,32 @@ from .base import (
 from .chat_template_safety import normalize_messages_for_chat_template
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_metal_buffer_cache_limit(
+    max_recommended: int,
+    gpu_memory_utilization: float,
+) -> tuple[int, str]:
+    """Resolve the MLX retained-buffer cache cap for Metal startup."""
+    env_limit = os.environ.get("MLX_BUFFER_CACHE_LIMIT")
+    if env_limit:
+        try:
+            limit = int(env_limit)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; using device-scaled cap",
+                env_limit,
+            )
+        else:
+            if limit > 0:
+                return limit, "MLX_BUFFER_CACHE_LIMIT"
+            logger.warning(
+                "Ignoring non-positive MLX_BUFFER_CACHE_LIMIT=%r; "
+                "using device-scaled cap",
+                env_limit,
+            )
+
+    return int(max_recommended * gpu_memory_utilization), "device-scaled"
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
@@ -195,6 +223,8 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
+        # Single thread that owns the model; see _generation_worker.
+        self._generation_executor: ThreadPoolExecutor | None = None
 
     @property
     def model_name(self) -> str:
@@ -230,16 +260,26 @@ class BatchedEngine(BaseEngine):
 
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # Load inline on the event-loop thread so mlx-lm's
-                    # generation_stream (created at module import on this
-                    # thread) and model weights are owned by the same thread
-                    # that drives scheduler.step (issue #407).
-                    self.prepare_for_start()
+                # Load on the thread that drives scheduler.step. MLX buffers
+                # carry the stream of the thread that built them, and
+                # BatchGenerator captures generation_stream into self._stream
+                # when it is created, so the two must be the same thread.
+                # Which thread that is depends on the path — see
+                # _model_load_executor.
+                executor = self._model_load_executor()
+                if executor is None:
+                    # MLLM: MLLMScheduler steps here, on the event loop.
+                    # Keep the pre-existing split for an overridden
+                    # prepare_for_start — test doubles may block and do not own
+                    # MLX state.
+                    if self._uses_default_prepare_for_start():
+                        self.prepare_for_start()
+                    else:
+                        await run_blocking_startup_work(self.prepare_for_start)
                 else:
-                    # Test doubles and custom overrides may block; run them via
-                    # the shared cancellation-safe thread helper.
-                    await run_blocking_startup_work(self.prepare_for_start)
+                    await run_blocking_startup_work(
+                        self.prepare_for_start, executor=executor
+                    )
 
             if self._is_mllm:
                 await self._start_mllm()
@@ -258,6 +298,41 @@ class BatchedEngine(BaseEngine):
         """Return True when prepare_for_start is the class implementation."""
         method = getattr(self.prepare_for_start, "__func__", None)
         return method is BatchedEngine.prepare_for_start
+
+    def _model_load_executor(self) -> ThreadPoolExecutor | None:
+        """Thread the model must be built on, or None for the event loop.
+
+        The two batched paths step on different threads, so they have to load
+        on different threads:
+
+        - MLLM never touches the generation worker. ``_start_mllm`` drives
+          MLLMScheduler, whose ``_process_loop`` calls ``step()`` on the event
+          loop with no executor hop, so an MLLM model has to be built there —
+          exactly as it was before generation was pinned.
+        - Everything else runs through AsyncEngineCore, which steps on the
+          worker, so it has to load there. Loading inline on the event loop
+          (issue #407) is what left BatchGenerator carrying a stream the
+          stepping thread did not have.
+
+        ResidencyManager reads this too, so it must answer for an engine that
+        has not started yet.
+        """
+        if self._is_mllm:
+            return None
+        return self._generation_worker()
+
+    def _generation_worker(self) -> ThreadPoolExecutor:
+        """Return the single thread that owns the model and drives stepping.
+
+        The residency manager also looks this up by name to load models here,
+        so it must exist before ``prepare_for_start`` runs and must outlive the
+        engine loop.
+        """
+        if self._generation_executor is None:
+            self._generation_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="engine-core"
+            )
+        return self._generation_executor
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -285,14 +360,19 @@ class BatchedEngine(BaseEngine):
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
+                    cache_limit, cache_limit_source = _resolve_metal_buffer_cache_limit(
+                        max_recommended,
+                        self._gpu_memory_utilization,
+                    )
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit)
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
+                        f"({cache_limit_source})"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
@@ -337,6 +417,10 @@ class BatchedEngine(BaseEngine):
         mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
         kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
         kv_bits = getattr(self._scheduler_config, "kv_cache_quantization_bits", 8)
+        # SSD cold tier — same SchedulerConfig fields the standard path reads
+        # (cli.py populates ssd_cache_dir/ssd_cache_max_gb).  None = disabled.
+        ssd_cache_dir = getattr(self._scheduler_config, "ssd_cache_dir", None)
+        ssd_cache_max_gb = getattr(self._scheduler_config, "ssd_cache_max_gb", 10.0)
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
@@ -372,6 +456,8 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,
+            ssd_cache_dir=ssd_cache_dir,
+            ssd_cache_max_gb=ssd_cache_max_gb,
             **mllm_extra,
         )
 
@@ -485,14 +571,19 @@ class BatchedEngine(BaseEngine):
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
+                    cache_limit, cache_limit_source = _resolve_metal_buffer_cache_limit(
+                        max_recommended,
+                        self._gpu_memory_utilization,
+                    )
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit)
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
+                        f"({cache_limit_source})"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
@@ -526,11 +617,12 @@ class BatchedEngine(BaseEngine):
             gpu_memory_utilization=self._gpu_memory_utilization,
         )
 
-        # Create async engine
+        # Create async engine, stepping on the thread that loaded the model.
         self._engine = AsyncEngineCore(
             model=self._model,
             tokenizer=self._tokenizer,
             config=engine_config,
+            generation_worker=self._generation_worker(),
         )
 
         await self._engine.engine.start()
@@ -551,6 +643,10 @@ class BatchedEngine(BaseEngine):
         self._processor = None
         self._mllm_instance = None
         self._loaded = False
+        if self._generation_executor is not None:
+            # The model and its streams lived on this thread; both go with it.
+            self._generation_executor.shutdown(wait=True)
+            self._generation_executor = None
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
