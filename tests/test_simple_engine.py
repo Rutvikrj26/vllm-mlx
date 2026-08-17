@@ -1508,7 +1508,10 @@ class TestSimpleEngineConcurrency:
         engine._loaded = True
         engine._text_model = MagicMock()
         engine._text_tokenizer = MagicMock()
-        engine._model = FakeMllmModel()
+        # lifecycle._prepare_engine_start runs prepare_for_start on the
+        # generation worker, so the model's owner thread is that worker rather
+        # than the event loop. Build the fake there to match.
+        engine._model = engine._generation_worker().submit(FakeMllmModel).result()
         engine._run_blocking_serialized = fail_if_called  # type: ignore[method-assign]
 
         outputs = [
@@ -1562,7 +1565,9 @@ class TestSimpleEngineConcurrency:
         )
         engine._loaded = True
         engine._text_model = MagicMock()
-        engine._model = FakeMllmModel()
+        # Same ownership rule as the media route: the model is built on the
+        # generation worker, so that is the thread stream_chat must run on.
+        engine._model = engine._generation_worker().submit(FakeMllmModel).result()
 
         outputs = [
             chunk
@@ -1784,9 +1789,14 @@ class TestSimpleEngineConcurrency:
     ):
         """MLLM text-only non-stream path must keep stream_chat on model thread.
 
-        Regression: aggregate_stream_chat -> stream_chat used _run_blocking_serialized,
-        which moved mlx_vlm stream generation to a worker thread and could raise
+        Regression: aggregate_stream_chat -> stream_chat moved mlx_vlm stream
+        generation off the thread that owns the model and could raise
         "There is no Stream(gpu, N) in current thread".
+
+        The owner is now the engine's pinned generation worker rather than the
+        caller's thread, so the model is built there — which is what ``start()``
+        does. The invariant under test is unchanged: whichever thread builds the
+        model must be the one that generates from it.
         """
         from types import SimpleNamespace
 
@@ -1808,7 +1818,10 @@ class TestSimpleEngineConcurrency:
         engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
         engine._loaded = True
         engine._text_model = None
-        engine._model = FakeMllmModel()
+        loop = asyncio.get_running_loop()
+        engine._model = await loop.run_in_executor(
+            engine._generation_worker(), FakeMllmModel
+        )
 
         output = await engine.chat(
             messages=[{"role": "user", "content": "Count: one, two, three"}],
@@ -1876,13 +1889,23 @@ class TestSimpleEngineConcurrency:
 
     @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
-        """Test that concurrent requests complete (may be in any order due to lock)."""
+        """Test that concurrent requests complete (may be in any order due to lock).
+
+        Uses "wait" admission explicitly. This test is about queued requests all
+        completing, not about the admission policy — the default "fail_fast"
+        rejects the second and third outright, which
+        ``test_default_admission_rejects_second_serialized_request`` covers.
+        Before generation was pinned to its own thread, the distinction was
+        invisible here: generation blocked the event loop, so the later requests
+        could not reach admission control until the first had already finished.
+        """
         from vllm_mlx.engine.simple import SimpleEngine
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._model = mock_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Launch multiple concurrent generate calls
             results = await asyncio.gather(
