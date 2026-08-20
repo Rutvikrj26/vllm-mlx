@@ -36,13 +36,42 @@ def _is_stream_thread_error(error: Exception) -> bool:
     return "no Stream(" in message or "no Stream(gpu" in message
 
 
+def _clear_request_event(request_event: Optional[asyncio.Event]) -> None:
+    if request_event is not None:
+        request_event.clear()
+
+
+def _set_request_event(request_event: Optional[asyncio.Event]) -> None:
+    if request_event is not None:
+        request_event.set()
+
+
+async def _wait_for_idle_or_request(
+    request_event: Optional[asyncio.Event], timeout: float
+) -> None:
+    if timeout <= 0:
+        await asyncio.sleep(0)
+        return
+
+    if request_event is None:
+        await asyncio.sleep(timeout)
+        return
+
+    try:
+        await asyncio.wait_for(request_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        request_event.clear()
+
+
 @dataclass
 class EngineConfig:
     """Configuration for the engine."""
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.001  # 1ms between steps
+    step_interval: float = 0.1  # Idle wait when the scheduler is empty
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
 
@@ -117,6 +146,7 @@ class EngineCore:
         # Engine state
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._request_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
@@ -128,6 +158,7 @@ class EngineCore:
             return
 
         self._running = True
+        self._request_event = asyncio.Event()
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
         logger.info("Engine started")
@@ -241,8 +272,8 @@ class EngineCore:
             _bind_worker_streams_once()
             self.scheduler._close_batch_generator()
 
-        step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
+        step_interval = self.config.step_interval
         use_simple_streaming = stream_interval == 1
 
         # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
@@ -260,6 +291,7 @@ class EngineCore:
             while self._running:
                 try:
                     if self.scheduler.has_requests():
+                        _clear_request_event(getattr(self, "_request_event", None))
                         if use_worker_thread:
                             try:
                                 output = await loop.run_in_executor(
@@ -333,8 +365,11 @@ class EngineCore:
                             # making the server unresponsive to all HTTP requests.
                             await asyncio.sleep(0)
                     else:
-                        # No work, yield control
-                        await asyncio.sleep(step_interval)
+                        # No work; wait longer than the active loop but wake
+                        # immediately when add_request signals new work.
+                        await _wait_for_idle_or_request(
+                            getattr(self, "_request_event", None), step_interval
+                        )
 
                 except asyncio.CancelledError:
                     raise
@@ -402,6 +437,7 @@ class EngineCore:
 
         # Add to scheduler
         self.scheduler.add_request(request)
+        _set_request_event(getattr(self, "_request_event", None))
 
         return request_id
 
