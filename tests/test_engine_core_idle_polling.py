@@ -14,6 +14,9 @@ class _IdleScheduler:
     def _close_batch_generator(self):
         pass
 
+    def close_ssd_tier(self):
+        pass
+
 
 class _RequestCapturingScheduler:
     def __init__(self):
@@ -89,6 +92,9 @@ async def test_engine_loop_wakes_promptly_for_request_added_while_parked(monkeyp
             return SimpleNamespace(outputs=[], finished_request_ids=[])
 
         def _close_batch_generator(self):
+            pass
+
+        def close_ssd_tier(self):
             pass
 
     engine.scheduler = _WakeableScheduler()
