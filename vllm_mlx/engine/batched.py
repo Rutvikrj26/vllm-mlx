@@ -197,6 +197,9 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
     ):
         """
         Initialize the batched engine.
@@ -216,6 +219,9 @@ class BatchedEngine(BaseEngine):
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._gpu_memory_utilization = gpu_memory_utilization
+        self._mllm_draft_model = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -345,6 +351,9 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             trust_remote_code=self._trust_remote_code,
             max_kv_size=max_kv_size,
+            draft_model=self._mllm_draft_model,
+            draft_kind=self._mllm_draft_kind,
+            draft_block_size=self._mllm_draft_block_size,
         )
         self._mllm_instance.load()
         self._model = self._mllm_instance.model
@@ -380,7 +389,11 @@ class BatchedEngine(BaseEngine):
             logger.warning(f"Failed to set Metal memory limits: {e}")
 
         # Inject MTP support if enabled
-        if self._scheduler_config and self._scheduler_config.enable_mtp:
+        if (
+            self._scheduler_config
+            and self._scheduler_config.enable_mtp
+            and self._mllm_draft_model is None
+        ):
             self._inject_mtp_mllm()
 
     async def _start_mllm(self) -> None:
@@ -464,10 +477,18 @@ class BatchedEngine(BaseEngine):
         )
 
         # Create and start MLLM scheduler
+        scheduler_kwargs = {}
+        if self._mllm_draft_model is not None:
+            scheduler_kwargs = {
+                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+            }
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
             config=mllm_config,
+            **scheduler_kwargs,
         )
         await self._mllm_scheduler.start()
 
@@ -830,6 +851,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             return GenerationOutput(
@@ -919,6 +941,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
