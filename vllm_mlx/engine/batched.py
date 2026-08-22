@@ -200,6 +200,7 @@ class BatchedEngine(BaseEngine):
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -212,6 +213,8 @@ class BatchedEngine(BaseEngine):
             force_mllm: Force loading as MLLM even if not auto-detected
             gpu_memory_utilization: Fraction of device memory for Metal allocation
                 limit and emergency threshold (0.0-1.0, default 0.90)
+            default_mllm_draft: Enable the configured assistant drafter unless a
+                request explicitly sets ``mllm_draft`` to false.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -222,6 +225,7 @@ class BatchedEngine(BaseEngine):
         self._mllm_draft_model = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
+        self._default_mllm_draft = default_mllm_draft
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -851,7 +855,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
-                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
+                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
             return GenerationOutput(
@@ -941,7 +945,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
-                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
+                mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -1239,6 +1243,19 @@ class BatchedEngine(BaseEngine):
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
+            if self._mllm_draft_model is not None:
+                mtp_stats = stats.setdefault("mtp", {})
+                mtp_stats.setdefault("enabled", True)
+                mtp_stats.setdefault("implementation", "external_assistant")
+                mtp_stats.update(
+                    {
+                        "draft_model": self._mllm_draft_model,
+                        "draft_kind": self._mllm_draft_kind,
+                        "draft_block_size": self._mllm_draft_block_size,
+                        "default_enabled": self._default_mllm_draft,
+                        "continuous_batching_supported": True,
+                    }
+                )
             # MLLM engine is always "running" once loaded
             if "running" not in stats:
                 stats["running"] = self._loaded

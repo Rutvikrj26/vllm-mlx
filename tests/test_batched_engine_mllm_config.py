@@ -143,30 +143,115 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
     }
 
 
-def test_generate_forwards_mllm_draft_opt_in():
+def _generation_output():
+    return SimpleNamespace(
+        output_text="ok",
+        output_token_ids=[1],
+        prompt_tokens=2,
+        completion_tokens=1,
+        finish_reason="stop",
+        mtp_drafts=1,
+        mtp_accepted=1,
+    )
+
+
+def _batched_mllm_engine(scheduler, *, default_mllm_draft=False):
     from vllm_mlx.engine.batched import BatchedEngine
 
-    scheduler = SimpleNamespace(
-        generate=AsyncMock(
-            return_value=SimpleNamespace(
-                output_text="ok",
-                output_token_ids=[1],
-                prompt_tokens=2,
-                completion_tokens=1,
-                finish_reason="stop",
-                mtp_drafts=1,
-                mtp_accepted=1,
-            )
-        )
+    engine = BatchedEngine(
+        model_name="gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=6,
+        default_mllm_draft=default_mllm_draft,
     )
-    engine = BatchedEngine.__new__(BatchedEngine)
     engine._loaded = True
-    engine._is_mllm = True
     engine._mllm_scheduler = scheduler
+    return engine
+
+
+def test_generate_forwards_mllm_draft_opt_in():
+    scheduler = SimpleNamespace(generate=AsyncMock(return_value=_generation_output()))
+    engine = _batched_mllm_engine(scheduler)
 
     asyncio.run(engine.generate("hello", mllm_draft=True))
 
     assert scheduler.generate.await_args.kwargs["mllm_draft"] is True
+
+
+def test_generate_uses_configured_mllm_draft_default():
+    scheduler = SimpleNamespace(generate=AsyncMock(return_value=_generation_output()))
+    engine = _batched_mllm_engine(
+        scheduler,
+        default_mllm_draft=True,
+    )
+
+    asyncio.run(engine.generate("hello"))
+
+    assert scheduler.generate.await_args.kwargs["mllm_draft"] is True
+
+
+def test_generate_allows_explicit_mllm_draft_opt_out():
+    scheduler = SimpleNamespace(generate=AsyncMock(return_value=_generation_output()))
+    engine = _batched_mllm_engine(
+        scheduler,
+        default_mllm_draft=True,
+    )
+
+    asyncio.run(engine.generate("hello", mllm_draft=False))
+
+    assert scheduler.generate.await_args.kwargs["mllm_draft"] is False
+
+
+def test_stream_generate_uses_configured_mllm_draft_default():
+    async def stream_outputs(_request_id):
+        yield SimpleNamespace(
+            output_text="ok",
+            new_text="ok",
+            prompt_tokens=2,
+            completion_tokens=1,
+            finished=True,
+            finish_reason="stop",
+            mtp_drafts=1,
+            mtp_accepted=1,
+        )
+
+    scheduler = SimpleNamespace(
+        add_request_async=AsyncMock(return_value="request-1"),
+        stream_outputs=stream_outputs,
+    )
+    engine = _batched_mllm_engine(
+        scheduler,
+        default_mllm_draft=True,
+    )
+
+    async def consume_stream():
+        return [output async for output in engine.stream_generate("hello")]
+
+    outputs = asyncio.run(consume_stream())
+
+    assert outputs[0].text == "ok"
+    assert scheduler.add_request_async.await_args.kwargs["mllm_draft"] is True
+
+
+def test_idle_stats_report_configured_mllm_draft_default():
+    engine = _batched_mllm_engine(
+        SimpleNamespace(get_stats=lambda: {}),
+        default_mllm_draft=True,
+    )
+
+    stats = engine.get_stats()
+
+    assert stats["mtp"] == {
+        "enabled": True,
+        "implementation": "external_assistant",
+        "draft_model": "assistant",
+        "draft_kind": "mtp",
+        "draft_block_size": 6,
+        "default_enabled": True,
+        "continuous_batching_supported": True,
+    }
 
 
 def _run_start_mllm(monkeypatch, scheduler_config):

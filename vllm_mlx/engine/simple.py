@@ -172,6 +172,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache: bool = False,
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -197,6 +198,8 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache: Enable mlx-lm LRUPromptCache on pure-LLM stream_chat
             prefix_trie_cache_size: Maximum prompt-cache trie entries
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
+            default_mllm_draft: Enable the configured assistant drafter unless a
+                request explicitly sets ``mllm_draft`` to false.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -242,6 +245,7 @@ class SimpleEngine(BaseEngine):
             "skips": 0,
             "tokens_saved": 0,
         }
+        self._default_mllm_draft = default_mllm_draft
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -779,6 +783,7 @@ class SimpleEngine(BaseEngine):
                 draft_model=self._mllm_draft_model_path,
                 draft_kind=self._mllm_draft_kind,
                 draft_block_size=self._mllm_draft_block_size,
+                default_draft_enabled=self._default_mllm_draft,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -1721,7 +1726,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
         has_media = has_media_content(messages)
 
         await self._ensure_text_model_for_request(
@@ -1761,8 +1766,7 @@ class SimpleEngine(BaseEngine):
             local_kwargs = dict(kwargs)
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
-            if mllm_draft_requested:
-                local_kwargs["mllm_draft"] = True
+            local_kwargs["mllm_draft"] = mllm_draft_requested
             return local_kwargs
 
         # Build prompt using tokenizer
@@ -3403,6 +3407,17 @@ class SimpleEngine(BaseEngine):
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
                 "backbone_pct": self._specprefill_backbone_pct,
+            }
+
+        if self._mllm_draft_model_path is not None:
+            stats["mtp"] = {
+                "enabled": True,
+                "implementation": "mlx_vlm_assistant",
+                "draft_model": self._mllm_draft_model_path,
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+                "default_enabled": self._default_mllm_draft,
+                "continuous_batching_supported": True,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)

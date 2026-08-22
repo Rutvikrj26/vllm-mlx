@@ -266,6 +266,81 @@ class TestCompletionRequest:
             )
 
 
+class TestCompletionMllmDraft:
+    """Test completion assistant-drafter overrides."""
+
+    @pytest.mark.anyio
+    async def test_nonstream_completion_forwards_mllm_draft_opt_out(self, monkeypatch):
+        from vllm_mlx.server import CompletionRequest, create_completion
+        import vllm_mlx.server as server
+
+        captured = {}
+
+        class DummyEngine:
+            async def generate(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    text="ok",
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_residency_manager", None)
+        monkeypatch.setattr(server, "_default_model_key", None)
+        monkeypatch.setattr(server, "get_engine", lambda: DummyEngine())
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            mllm_draft=False,
+        )
+        response = await create_completion(request, raw_request=None)
+
+        assert response.choices[0].text == "ok"
+        assert captured["mllm_draft"] is False
+
+    @pytest.mark.anyio
+    async def test_stream_completion_forwards_mllm_draft_opt_out(self):
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        captured = {}
+
+        class DummyEngine:
+            async def stream_generate(self, **kwargs):
+                captured.update(kwargs)
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            mllm_draft=False,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_completion(
+                DummyEngine(),
+                "hello",
+                request,
+                max_tokens=8,
+            )
+        ]
+
+        assert chunks
+        assert captured["mllm_draft"] is False
+
+
 class TestSamplingDefaults:
     """Test server-wide sampling default resolution."""
 
@@ -777,6 +852,62 @@ class TestLoadModelTrustRemoteCode:
             )
 
         assert mock_engine.call_args.kwargs["trust_remote_code"] is True
+
+    def test_load_model_forwards_default_mllm_draft_to_simple_engine(self, monkeypatch):
+        """Configured assistant drafters must not require a private request flag."""
+        from vllm_mlx import server
+
+        # load_model mutates module-level serving state. Register the current
+        # value with monkeypatch so this test cannot affect later request tests.
+        monkeypatch.setattr(server, "_model_name", server._model_name)
+
+        fake_engine = MagicMock()
+        fake_loop = MagicMock()
+
+        with (
+            patch.object(
+                server, "SimpleEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+            patch("vllm_mlx.server.asyncio.new_event_loop", return_value=fake_loop),
+            patch("vllm_mlx.server.asyncio.set_event_loop"),
+        ):
+            server.load_model(
+                "gemma4",
+                force_mllm=True,
+                mllm_draft_model="assistant",
+                mllm_draft_kind="mtp",
+                default_mllm_draft=True,
+            )
+
+        assert mock_engine.call_args.kwargs["default_mllm_draft"] is True
+
+    def test_load_model_forwards_default_mllm_draft_to_batched_engine(
+        self, monkeypatch
+    ):
+        """Batched assistant drafters should honor the configured default."""
+        from vllm_mlx import server
+
+        monkeypatch.setattr(server, "_model_name", server._model_name)
+
+        fake_engine = MagicMock()
+
+        with (
+            patch.object(
+                server, "BatchedEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+        ):
+            server.load_model(
+                "gemma4",
+                use_batching=True,
+                force_mllm=True,
+                mllm_draft_model="assistant",
+                mllm_draft_kind="mtp",
+                default_mllm_draft=True,
+            )
+
+        assert mock_engine.call_args.kwargs["default_mllm_draft"] is True
 
 
 # =============================================================================
