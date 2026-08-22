@@ -42,7 +42,10 @@ from .base import (
     run_blocking_startup_work,
     shield_task,
 )
-from .chat_template_safety import normalize_messages_for_chat_template
+from .chat_template_safety import (
+    build_system_prompt_cache_prefix,
+    normalize_messages_for_chat_template,
+)
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -549,9 +552,13 @@ class SimpleEngine(BaseEngine):
         return self._prefix_trie_cache
 
     def _fetch_prefix_trie_cache(
-        self, model: Any, tokens: list[int]
+        self,
+        model: Any,
+        tokens: list[int],
+        *,
+        minimum_tokens_saved: int = 0,
     ) -> tuple[Any | None, list[int] | None, int]:
-        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        """Fetch a trie entry only when it beats the existing cached prefix."""
         prefix_trie = self._ensure_prefix_trie_cache()
         if prefix_trie is None:
             return None, None, 0
@@ -559,6 +566,18 @@ class SimpleEngine(BaseEngine):
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
+                if minimum_tokens_saved > 0:
+                    candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
+                        prefix_trie,
+                        model,
+                        tokens,
+                    )
+                    if (
+                        candidate_tokens_saved is None
+                        or candidate_tokens_saved <= minimum_tokens_saved
+                    ):
+                        self._prefix_trie_cache_stats["skips"] += 1
+                        return None, None, 0
                 trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
@@ -573,6 +592,9 @@ class SimpleEngine(BaseEngine):
                 trie_rest = [tokens[-1]]
 
             tokens_saved = len(tokens) - len(trie_rest)
+            if tokens_saved <= minimum_tokens_saved:
+                self._prefix_trie_cache_stats["skips"] += 1
+                return None, None, 0
             self._prefix_trie_cache_stats["hits"] += 1
             self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
             return trie_cache, list(trie_rest), tokens_saved
@@ -580,6 +602,58 @@ class SimpleEngine(BaseEngine):
             self._prefix_trie_cache_stats["skips"] += 1
             logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
             return None, None, 0
+
+    @staticmethod
+    def _peek_prefix_trie_tokens_saved(
+        prefix_trie: Any,
+        model: Any,
+        tokens: list[int],
+    ) -> int | None:
+        """Return reusable tokens without copying the matched prompt cache.
+
+        mlx-lm 0.31.3+ exposes no public non-copying lookup. Its LRUPromptCache
+        keeps the search metadata on ``_trie``; feature-detect that stable shape
+        and safely prefer the existing system snapshot if it changes upstream.
+        """
+        trie = getattr(prefix_trie, "_trie", None)
+        search = getattr(trie, "search", None)
+        if not callable(search):
+            return None
+
+        result = search(model, tokens)
+
+        def _entry_is_trimmable(cache_key: list[int]) -> bool | None:
+            get_entry = getattr(trie, "get", None)
+            if not callable(get_entry):
+                return None
+
+            from mlx_lm.models.cache import can_trim_prompt_cache
+
+            entry = get_entry(result.model, cache_key)
+            prompt_cache = getattr(entry, "prompt_cache", None)
+            if prompt_cache is None:
+                return None
+            return can_trim_prompt_cache(prompt_cache)
+
+        exact = getattr(result, "exact", None)
+        if exact is not None:
+            exact_is_trimmable = _entry_is_trimmable(exact)
+            if exact_is_trimmable is None:
+                return None
+            return max(0, len(tokens) - 1) if exact_is_trimmable else 0
+
+        shorter = getattr(result, "shorter", None)
+        shorter_length = len(shorter) if shorter is not None else 0
+        longer = getattr(result, "longer", None)
+        common_prefix = getattr(result, "common_prefix", 0)
+        if longer is not None and common_prefix > shorter_length:
+            longer_is_trimmable = _entry_is_trimmable(longer)
+            if longer_is_trimmable is None:
+                return None
+            if longer_is_trimmable:
+                return min(len(tokens) - 1, common_prefix)
+
+        return shorter_length
 
     def _insert_prefix_trie_cache(
         self, model: Any, cache_key: list[int], prompt_cache: Any
@@ -1833,6 +1907,7 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
+        safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
             # Per-request enable_thinking override; default: True unless coder model.
             enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1996,25 +2071,6 @@ class SimpleEngine(BaseEngine):
                 cache_blocking_controls,
             )
 
-        # Normalize messages to plain dicts. The public stream_chat signature
-        # types messages as list[dict], but internal callers (server.py,
-        # tests) sometimes pass Pydantic Message objects directly; those
-        # don't expose a dict-style .get() interface.
-        def _to_msg_dict(m: Any) -> dict[str, Any]:
-            if isinstance(m, dict):
-                return m
-            if hasattr(m, "model_dump"):
-                return m.model_dump()
-            if hasattr(m, "dict"):
-                return m.dict()
-            return {
-                "role": getattr(m, "role", None),
-                "content": getattr(m, "content", ""),
-            }
-
-        messages_for_cache = [_to_msg_dict(m) for m in messages]
-        has_system = any(m.get("role") == "system" for m in messages_for_cache)
-
         if (
             self._prefix_trie_cache_enabled
             and not cache_blocking_controls
@@ -2026,93 +2082,59 @@ class SimpleEngine(BaseEngine):
             full_token_count = len(full_tokens_list)
             prefix_trie_eligible = bool(full_tokens_list)
 
-        if (
-            has_system
-            and not cache_blocking_controls
-            and hasattr(tokenizer, "apply_chat_template")
-        ):
+        system_prefix_text = None
+        if not cache_blocking_controls and hasattr(tokenizer, "apply_chat_template"):
+            system_prefix_text = build_system_prompt_cache_prefix(
+                tokenizer,
+                messages,
+                template_kwargs=template_kwargs,
+                normalized_messages=safe_messages,
+            )
 
-            def _with_user(user_content: str) -> list[dict[str, Any]]:
-                msgs = [dict(m) for m in messages_for_cache]
-                if msgs and msgs[-1].get("role") == "user":
-                    msgs[-1] = {**msgs[-1], "content": user_content}
+        if system_prefix_text is not None:
+            system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[:16]
+
+            add_special = tokenizer.bos_token is None or not prompt.startswith(
+                tokenizer.bos_token
+            )
+            if full_tokens_list is None:
+                full_tokens_list = tokenizer.encode(
+                    prompt, add_special_tokens=add_special
+                )
+            system_tokens_list = tokenizer.encode(
+                system_prefix_text, add_special_tokens=add_special
+            )
+            full_token_count = len(full_tokens_list)
+            system_token_count = len(system_tokens_list)
+
+            if (
+                len(full_tokens_list) > system_token_count
+                and full_tokens_list[:system_token_count] == system_tokens_list
+            ):
+                system_tokens = system_tokens_list
+                suffix_tokens = full_tokens_list[system_token_count:]
+                kv_cache_eligible = True
+                # Read the snapshot reference once. If we promote to HIT,
+                # ``hit_snapshot`` is the exact list the dict lookup returned.
+                candidate = self._system_kv_cache.get(system_hash)
+                if candidate is not None and system_token_count == candidate[1]:
+                    cache_hit = True
+                    hit_snapshot = candidate[0]
+                    logger.info(
+                        "System KV cache HIT (stream_chat): reusing %d "
+                        "tokens, prefilling %d new (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
+                    )
                 else:
-                    msgs = [*msgs, {"role": "user", "content": user_content}]
-                return msgs
-
-            rendered_a: Any = None
-            rendered_b: Any = None
-            try:
-                rendered_a = tokenizer.apply_chat_template(
-                    _with_user("Alpha"), **template_kwargs
-                )
-                rendered_b = tokenizer.apply_chat_template(
-                    _with_user("Bravo"), **template_kwargs
-                )
-            except Exception:
-                pass
-
-            if isinstance(rendered_a, str) and isinstance(rendered_b, str):
-                boundary = 0
-                diverged = False
-                for i in range(min(len(rendered_a), len(rendered_b))):
-                    if rendered_a[i] != rendered_b[i]:
-                        diverged = True
-                        break
-                    boundary = i + 1
-
-                if diverged and boundary >= 16:
-                    system_prefix_text = rendered_a[:boundary]
-                    system_hash = hashlib.sha256(
-                        system_prefix_text.encode()
-                    ).hexdigest()[:16]
-
-                    add_special = tokenizer.bos_token is None or not prompt.startswith(
-                        tokenizer.bos_token
+                    logger.info(
+                        "System KV cache MISS (stream_chat): will "
+                        "prefill %d system + %d suffix tokens (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
                     )
-                    if full_tokens_list is None:
-                        full_tokens_list = tokenizer.encode(
-                            prompt, add_special_tokens=add_special
-                        )
-                    system_tokens_list = tokenizer.encode(
-                        system_prefix_text, add_special_tokens=add_special
-                    )
-                    full_token_count = len(full_tokens_list)
-                    system_token_count = len(system_tokens_list)
-
-                    if (
-                        len(full_tokens_list) > system_token_count
-                        and full_tokens_list[:system_token_count] == system_tokens_list
-                    ):
-                        system_tokens = system_tokens_list
-                        suffix_tokens = full_tokens_list[system_token_count:]
-                        kv_cache_eligible = True
-                        # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the dict
-                        # lookup just returned. A later concurrent MISS that
-                        # mutates ``self._system_kv_cache`` before our
-                        # serialized worker restores it cannot alias what we
-                        # captured here — dict.get is atomic under the GIL
-                        # and returns a reference to an immutable tuple.
-                        candidate = self._system_kv_cache.get(system_hash)
-                        if candidate is not None and system_token_count == candidate[1]:
-                            cache_hit = True
-                            hit_snapshot = candidate[0]
-                            logger.info(
-                                "System KV cache HIT (stream_chat): reusing %d "
-                                "tokens, prefilling %d new (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
-                        else:
-                            logger.info(
-                                "System KV cache MISS (stream_chat): will "
-                                "prefill %d system + %d suffix tokens (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
 
         if kv_cache_eligible or prefix_trie_eligible:
             # Cache-aware path: drive mlx-lm directly with a prompt cache.
@@ -2147,13 +2169,25 @@ class SimpleEngine(BaseEngine):
                 prefix_trie_rest_tokens: list[int] | None = None
                 local_hit_snapshot = hit_snapshot
 
+                # A system snapshot can coexist with a longer conversation-prefix
+                # entry. Preserve the empty-trie fast path, otherwise let them
+                # compete by tokens saved.
+                with self._prefix_trie_cache_lock:
+                    prefix_trie_has_entries = bool(self._prefix_trie_cache)
+
                 # The model, prompt caches, and MLX streams belong to the pinned
                 # generation worker. LRUPromptCache.fetch_nearest_cache deep-copies
                 # cache arrays, so looking up on the event-loop thread would cross
                 # the same ownership boundary that worker pinning protects.
-                if prefix_trie_eligible and not cache_hit:
+                if prefix_trie_eligible and (not cache_hit or prefix_trie_has_entries):
                     trie_cache, trie_rest, trie_tokens_saved = (
-                        self._fetch_prefix_trie_cache(model, cache_key)
+                        self._fetch_prefix_trie_cache(
+                            model,
+                            cache_key,
+                            minimum_tokens_saved=(
+                                system_token_count if cache_hit else 0
+                            ),
+                        )
                     )
                     if trie_cache is not None and trie_rest is not None:
                         prefix_trie_hit = True
