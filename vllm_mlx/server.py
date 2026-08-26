@@ -996,6 +996,9 @@ _STREAMING_TOOL_MARKERS = (
     # streaming gates scan, so the harmony tokens remain present.
     "<|channel|>commentary",
     "<|call|>",
+    # DeepSeek-V4 DSML. Listed as the bare token rather than the full
+    # <｜DSML｜tool_calls> marker so a partial chunk still trips the gate.
+    "｜DSML｜",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
@@ -2671,7 +2674,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
-    tool_markup_possible = False
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2686,7 +2689,10 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         use_reasoning = reasoning_parser and not _thinking_disabled(
             request, chat_kwargs
         )
-        if not delta_text and not (use_reasoning and output_finished):
+        if not delta_text and not (
+            (use_reasoning and output_finished)
+            or (tool_parser and tool_markup_possible and output_finished)
+        ):
             continue
 
         previous_text = raw_accumulated_text
@@ -2701,7 +2707,10 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 finished=output_finished,
             )
             if delta_msg is None:
-                continue
+                if output_finished and tool_parser and tool_markup_possible:
+                    delta_msg = DeltaMessage()
+                else:
+                    continue
 
             if delta_msg.reasoning:
                 for event in _start_reasoning_item():
@@ -2719,10 +2728,29 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 )
                 sequence += 1
 
-            if delta_msg.content:
+            content = delta_msg.content or ""
+            if tool_parser and (content or (output_finished and tool_markup_possible)):
+                tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
+                    tool_parser,
+                    tool_accumulated_text,
+                    content,
+                    tool_request_context,
+                )
+                if output_finished and (
+                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                ):
+                    tool_result = _finalize_streaming_tool_result(
+                        tool_parser, tool_accumulated_text, tool_result
+                    )
+                if tool_result is None or "tool_calls" in tool_result:
+                    content = ""
+                else:
+                    content = tool_result.get("content", "")
+
+            if content:
                 for event in _start_text_item():
                     yield event
-                accumulated_text += delta_msg.content
+                accumulated_text += content
                 yield _responses_sse_event(
                     "response.output_text.delta",
                     ResponseOutputTextDeltaEvent(
@@ -2730,7 +2758,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                         item_id=text_item_id,
                         output_index=text_output_index,
                         content_index=0,
-                        delta=delta_msg.content,
+                        delta=content,
                     ),
                 )
                 sequence += 1
@@ -2759,9 +2787,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     delta_text,
                     tool_request_context,
                 )
-                if tool_result is None and output.finished:
+                if output.finished and (
+                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                ):
                     tool_result = _finalize_streaming_tool_result(
-                        tool_parser, tool_accumulated_text
+                        tool_parser, tool_accumulated_text, tool_result
                     )
                 if tool_result is None:
                     continue
@@ -3221,6 +3251,11 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
     )
 
 
+def _requires_eager_tool_streaming(tool_parser) -> bool:
+    """Return whether a parser must receive every delta from response start."""
+    return bool(getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False))
+
+
 def _streaming_tool_markup_possible_after_delta(
     accumulated_text: str, delta_text: str, tool_parser=None
 ) -> bool:
@@ -3239,12 +3274,28 @@ def _streaming_tool_markup_possible_after_delta(
     return _streaming_tool_markup_possible(check_text, tool_parser)
 
 
-def _finalize_streaming_tool_result(tool_parser, current_text: str):
+def _finalize_streaming_tool_result(
+    tool_parser, current_text: str, result: dict | None = None
+):
     """Let parsers resolve an ambiguous prefix at end of generation."""
     finalize = getattr(tool_parser, "finalize_streaming", None)
     if finalize is None:
-        return None
-    return finalize(current_text)
+        return result
+    final = finalize(current_text)
+    if final is None:
+        return result
+    if result is None:
+        return final
+
+    merged = dict(result)
+    if final.get("content"):
+        merged["content"] = (merged.get("content") or "") + final["content"]
+    if final.get("tool_calls"):
+        merged["tool_calls"] = [
+            *(merged.get("tool_calls") or []),
+            *final["tool_calls"],
+        ]
+    return merged
 
 
 def load_embedding_model(
@@ -6025,8 +6076,8 @@ async def _stream_anthropic_messages(
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
     tool_accumulated_text = ""
-    tool_markup_possible = False
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     tool_request_context = openai_request.model_dump()
 
     try:
@@ -6043,12 +6094,18 @@ async def _stream_anthropic_messages(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if not delta_text and not (use_reasoning and output_finished):
+            if not delta_text and not (
+                (use_reasoning and output_finished)
+                or (tool_parser and tool_markup_possible and output_finished)
+            ):
                 continue
 
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered and not (use_reasoning and output_finished):
+            if not filtered and not (
+                (use_reasoning and output_finished)
+                or (tool_parser and tool_markup_possible and output_finished)
+            ):
                 continue
 
             if not use_reasoning:
@@ -6081,9 +6138,12 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if tool_result is None and output.finished:
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
                             tool_result = _finalize_streaming_tool_result(
-                                tool_parser, tool_accumulated_text
+                                tool_parser, tool_accumulated_text, tool_result
                             )
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
@@ -6112,7 +6172,10 @@ async def _stream_anthropic_messages(
             )
 
             if delta_msg is None:
-                continue
+                if output_finished and tool_parser and tool_markup_possible:
+                    delta_msg = DeltaMessage()
+                else:
+                    continue
 
             if delta_msg.reasoning:
                 if not thinking_block_started:
@@ -6120,8 +6183,10 @@ async def _stream_anthropic_messages(
                     thinking_block_started = True
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
 
-            if delta_msg.content:
-                content_to_emit = delta_msg.content
+            content_to_emit = delta_msg.content or ""
+            if content_to_emit or (
+                tool_parser and output_finished and tool_markup_possible
+            ):
 
                 # Filter tool call markup during streaming
                 if tool_parser and (
@@ -6145,9 +6210,12 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if tool_result is None and output.finished:
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
                             tool_result = _finalize_streaming_tool_result(
-                                tool_parser, tool_accumulated_text
+                                tool_parser, tool_accumulated_text, tool_result
                             )
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
@@ -6394,8 +6462,8 @@ async def stream_chat_completion(
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until markers appear
     tool_parser = _get_streaming_tool_parser(request, engine)
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
     # finished=True output can be swallowed by a parser `continue` below (e.g.
     # a bare end-of-turn token arriving after a completed tool call); without
@@ -6436,14 +6504,18 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    # Skip this chunk (e.g., <think> token itself)
-                    continue
+                    if output_finished and tool_parser and tool_markup_possible:
+                        delta_msg = DeltaMessage()
+                    else:
+                        # Skip this chunk (e.g., <think> token itself)
+                        continue
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
                 )
+                content = content or ""
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
@@ -6456,7 +6528,9 @@ async def stream_chat_completion(
                         reasoning = None
 
                 # Tool call parsing on content portion
-                if tool_parser and content:
+                if tool_parser and (
+                    content or (output_finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
@@ -6477,9 +6551,12 @@ async def stream_chat_completion(
                             )
                         )
 
-                        if tool_result is None and output.finished:
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
                             tool_result = _finalize_streaming_tool_result(
-                                tool_parser, tool_accumulated_text
+                                tool_parser, tool_accumulated_text, tool_result
                             )
 
                         if tool_result is None:
@@ -6625,9 +6702,12 @@ async def stream_chat_completion(
                             )
                         )
 
-                        if tool_result is None and output.finished:
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
                             tool_result = _finalize_streaming_tool_result(
-                                tool_parser, tool_accumulated_text
+                                tool_parser, tool_accumulated_text, tool_result
                             )
 
                         if tool_result is None:

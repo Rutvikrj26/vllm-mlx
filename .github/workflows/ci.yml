@@ -94,6 +94,9 @@ jobs:
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \
+            tests/test_deepseek_v4_encoding.py \
+            tests/test_deepseek_v4_reasoning.py \
+            tests/test_deepseek_v4_tool_parser.py \
             tests/test_minimax_tool_calling.py \
             tests/test_qwen3_xml_parser.py \
             tests/test_qwen3_xml_registration.py \

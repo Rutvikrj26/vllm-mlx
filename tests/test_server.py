@@ -2240,6 +2240,223 @@ class TestStreamChatCompletion:
         }
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("parser_name", ["deepseek_v4", "auto"])
+    async def test_deepseek_v4_split_marker_never_leaks(self, monkeypatch, parser_name):
+        """The request-local DSML parser must see text before the split marker."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        d = "｜DSML｜"
+        deltas = [
+            "Checking.\n\n",
+            "<",
+            d,
+            "tool_calls>\n",
+            f'<{d}invoke name="get_weather">\n',
+            f'<{d}parameter name="city" string="true">Prague</{d}parameter>\n',
+            f"</{d}invoke>\n",
+            f"</{d}tool_calls>",
+        ]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                for index, delta in enumerate(deltas):
+                    finished = index == len(deltas) - 1
+                    yield GenerationOutput(
+                        text="",
+                        new_text=delta,
+                        finished=finished,
+                        finish_reason="stop" if finished else None,
+                    )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", parser_name)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            payload["choices"][0]["delta"].get("content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert content.strip() == "Checking."
+        assert d not in content
+        assert len(tool_payloads) == 1
+        assert (
+            tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+            == "get_weather"
+        )
+
+    @pytest.mark.anyio
+    async def test_deepseek_v4_truncated_dsml_is_visible_at_eos(self, monkeypatch):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        d = "｜DSML｜"
+        truncated = f'Before <{d}tool_calls>\n<{d}invoke name="f'
+        model_output = "thinking</think>" + truncated
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text=model_output,
+                    finished=False,
+                )
+                yield GenerationOutput(
+                    text="",
+                    new_text="",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "deepseek_v4")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "deepseek_v4")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            payload["choices"][0]["delta"].get("content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+
+        assert content == truncated
+        assert payloads[-1]["choices"][0]["finish_reason"] == "length"
+
+    @pytest.mark.anyio
+    async def test_deepseek_v4_reasoning_flushes_final_lt_and_terminal(
+        self, monkeypatch
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(text="", new_text="2 ", finished=False)
+                yield GenerationOutput(
+                    text="",
+                    new_text="<",
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "deepseek_v4")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        reasoning = "".join(
+            payload["choices"][0]["delta"].get("reasoning_content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+
+        assert reasoning == "2 <"
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
     async def test_stream_without_parser_flags_keeps_plain_text(self, monkeypatch):
         """Generic streaming fallback should not interfere with normal text."""
         from vllm_mlx.engine.base import GenerationOutput
